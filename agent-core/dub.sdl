@@ -3,6 +3,9 @@ description "Headless model container operations shared by Inochi Creator GUI an
 authors "Inochi2D Project, pixelsama"
 license "BSD-2-Clause"
 
+dependency "psd-d" version="~>0.6.1"
+dependency "imagefmt" version="~>2.1.0"
+
 sourcePaths "source"
 
 configuration "library" {

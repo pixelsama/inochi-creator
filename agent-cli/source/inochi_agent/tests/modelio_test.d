@@ -27,6 +27,7 @@ private ubyte[] createFixture() {
                 {
                     "type":"Part",
                     "uuid":42,
+                    "psdLayerPath":"/Eyes/Iris",
                     "mesh":{
                         "verts":[0,0,1,0,1,1,0,1],
                         "uvs":[0,0,1,0,1,1,0,1],
@@ -147,11 +148,50 @@ unittest {
     assert(inputSummary.partCount == 1);
     assert(inputSummary.parameterCount == 1);
     assert(inputSummary.textureCount == 1);
+    assert(parseJSON(inputSummary.toJson())["name"].str == "headless-model");
+    assert(agentFindPartUuidByPsdPath(inputPath, "/Eyes/Iris") == 42);
 
     auto outputSummary = agentRoundTripModel(inputPath, outputPath);
     assert(exists(outputPath));
     assert(outputSummary == inputSummary);
     assert(cast(ubyte[]) read(outputPath) == fixture);
+}
+
+unittest {
+    string inputPath = testPath("inochi-agent-path-mesh-input.inx");
+    string outputPath = testPath("inochi-agent-path-mesh-output.inx");
+
+    scope(exit) {
+        if (exists(inputPath)) remove(inputPath);
+        if (exists(outputPath)) remove(outputPath);
+    }
+
+    auto fixture = createFixture();
+    write(inputPath, fixture);
+
+    auto replacement = agentReplacePartMeshByPsdPath(
+        inputPath,
+        outputPath,
+        "/Eyes/Iris",
+        replacementMesh()
+    );
+    assert(replacement.partUuid == 42);
+    assert(replacement.vertexCount == 4);
+    assert(replacement.triangleCount == 2);
+    assert(binarySuffix(cast(ubyte[]) read(outputPath)) == binarySuffix(fixture));
+
+    bool missingRejected;
+    try {
+        agentReplacePartMeshByPsdPath(
+            inputPath,
+            outputPath,
+            "/Eyes/Missing",
+            replacementMesh()
+        );
+    } catch (Exception) {
+        missingRejected = true;
+    }
+    assert(missingRejected);
 }
 
 unittest {

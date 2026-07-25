@@ -1,0 +1,64 @@
+diff --git a/source/inochi2d/core/nodes/composite/package.d b/source/inochi2d/core/nodes/composite/package.d
+--- a/source/inochi2d/core/nodes/composite/package.d
++++ b/source/inochi2d/core/nodes/composite/package.d
+@@ -419,32 +419,34 @@ public:
+ 
+     override
+     void drawOne() {
+-        if (!enabled) return;
+-        
+-        this.selfSort();
+-        this.drawContents();
+-
+-        size_t cMasks = maskCount;
+-
+-        if (masks.length > 0) {
+-            inBeginMask(cMasks > 0);
+-
+-            foreach(ref mask; masks) {
+-                mask.maskSrc.renderMask(mask.mode == MaskingMode.DodgeMask);
+-            }
+-
+-            inBeginMaskContent();
+-
+-            // We are the content
+-            this.drawSelf();
+-
+-            inEndMask();
+-            return;
+-        }
+-
+-        // No masks, draw normally
+-        super.drawOne();
+-        this.drawSelf();
++        version (InDoesRender) {
++            if (!enabled) return;
++
++            this.selfSort();
++            this.drawContents();
++
++            size_t cMasks = maskCount;
++
++            if (masks.length > 0) {
++                inBeginMask(cMasks > 0);
++
++                foreach(ref mask; masks) {
++                    mask.maskSrc.renderMask(mask.mode == MaskingMode.DodgeMask);
++                }
++
++                inBeginMaskContent();
++
++                // We are the content
++                this.drawSelf();
++
++                inEndMask();
++                return;
++            }
++
++            // No masks, draw normally
++            super.drawOne();
++            this.drawSelf();
++        }
+     }
+ 
+     override

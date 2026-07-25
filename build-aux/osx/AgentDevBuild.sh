@@ -7,6 +7,7 @@ DEPS_ROOT=${INOCHI_AGENT_DEPS_ROOT:-"$ROOT/.agent-deps"}
 I2D_IMGUI_DIR="$DEPS_ROOT/i2d-imgui-0.8.1"
 I2D_PATCH="$ROOT/build-aux/osx/patches/i2d-imgui-arm64-development.patch"
 INOCHI2D_DIR="$DEPS_ROOT/inochi2d-0.8.7"
+INOCHI2D_RENDERLESS_PATCH="$ROOT/build-aux/osx/patches/inochi2d-renderless-composite.patch"
 NUMEM_DIR="$DEPS_ROOT/numem-0.20.1"
 
 if [ ! -x "$TOOLCHAIN_ROOT/bin/ldc2" ]; then
@@ -39,6 +40,10 @@ fi
 if [ ! -d "$INOCHI2D_DIR/.git" ]; then
     git clone --depth 1 --branch v0.8.7 \
         https://github.com/Inochi2D/inochi2d.git "$INOCHI2D_DIR"
+fi
+
+if ! git -C "$INOCHI2D_DIR" apply --reverse --check "$INOCHI2D_RENDERLESS_PATCH" >/dev/null 2>&1; then
+    git -C "$INOCHI2D_DIR" apply "$INOCHI2D_RENDERLESS_PATCH"
 fi
 
 dub add-local "$I2D_IMGUI_DIR" 0.8.1 --cache=local >/dev/null

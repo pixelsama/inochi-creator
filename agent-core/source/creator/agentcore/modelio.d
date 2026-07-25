@@ -5,7 +5,6 @@ import std.file : read, write;
 import std.format : format;
 import std.json : JSONType, JSONValue, parseJSON;
 import std.math : isFinite;
-import std.string : representation;
 
 enum ubyte[] agentMagicBytes = cast(ubyte[])"TRNSRTS\0";
 enum ubyte[] agentTextureSection = cast(ubyte[])"TEX_SECT";
@@ -21,7 +20,7 @@ struct ModelSummary {
     string toJson() const {
         return format(
             `{"name":%s,"nodeCount":%s,"partCount":%s,"parameterCount":%s,"textureCount":%s}`,
-            representation(name),
+            JSONValue(name).toString(),
             nodeCount,
             partCount,
             parameterCount,
@@ -49,11 +48,17 @@ struct AgentMeshSummary {
     }
 }
 
+struct AgentTextureBlob {
+    ubyte type;
+    ubyte[] data;
+}
+
 private struct InxDocument {
     ubyte[] originalBytes;
     JSONValue payload;
     ubyte[] binarySuffix;
     size_t textureCount;
+    AgentTextureBlob[] textureBlobs;
 }
 
 private void requireSection(const(ubyte)[] actual, const(ubyte)[] expected, string label) {
@@ -98,10 +103,17 @@ private InxDocument parseInx(const(ubyte)[] input) {
     );
 
     uint textureCount = readUInt32(bytes, "texture count");
+    AgentTextureBlob[] textureBlobs;
+    textureBlobs.reserve(textureCount);
     foreach (textureIndex; 0 .. textureCount) {
         uint textureLength = readUInt32(bytes, format("texture %s length", textureIndex));
-        readSlice(bytes, 1, format("texture %s tag", textureIndex));
-        readSlice(bytes, textureLength, format("texture %s data", textureIndex));
+        auto textureType = readSlice(bytes, 1, format("texture %s tag", textureIndex))[0];
+        auto textureData = readSlice(
+            bytes,
+            textureLength,
+            format("texture %s data", textureIndex)
+        );
+        textureBlobs ~= AgentTextureBlob(textureType, textureData.dup);
     }
 
     if (bytes.length > 0) {
@@ -124,7 +136,7 @@ private InxDocument parseInx(const(ubyte)[] input) {
         throw new Exception("Unexpected trailing bytes in INX document.");
     }
 
-    return InxDocument(input.dup, payload, binarySuffix, textureCount);
+    return InxDocument(input.dup, payload, binarySuffix, textureCount, textureBlobs);
 }
 
 private ubyte[] serializeInx(InxDocument document) {
@@ -209,6 +221,14 @@ ModelSummary agentInspectModel(string path) {
  */
 JSONValue agentReadModelPayload(string path) {
     return parseInx(cast(const(ubyte)[]) read(path)).payload;
+}
+
+/**
+ * Returns decoded INX texture container records without instantiating GPU
+ * textures. The encoded image bytes are copied out of the source document.
+ */
+AgentTextureBlob[] agentReadModelTextures(string path) {
+    return parseInx(cast(const(ubyte)[]) read(path)).textureBlobs;
 }
 
 private JSONValue requireMeshField(JSONValue mesh, string field) {
@@ -407,6 +427,62 @@ private bool findPartMesh(JSONValue node, ulong requestedUuid, out JSONValue mes
     return false;
 }
 
+private void findPartUuidsByPsdPath(
+    JSONValue node,
+    string requestedPath,
+    ref ulong[] matches
+) {
+    if (node.type != JSONType.object) {
+        throw new Exception("Invalid node tree.");
+    }
+
+    auto nodeType = objectField(node, "type", JSONValue(""));
+    if (
+        nodeType.type == JSONType.string &&
+        nodeType.str == "Part" &&
+        "uuid" in node.object &&
+        "psdLayerPath" in node.object &&
+        node["psdLayerPath"].type == JSONType.string &&
+        node["psdLayerPath"].str == requestedPath
+    ) {
+        matches ~= readIndex(node["uuid"], "Part uuid");
+    }
+
+    if ("children" in node.object) {
+        if (node["children"].type != JSONType.array) {
+            throw new Exception("Invalid node children.");
+        }
+        foreach (child; node["children"].array) {
+            findPartUuidsByPsdPath(child, requestedPath, matches);
+        }
+    }
+}
+
+private ulong requirePartUuidByPsdPath(JSONValue payload, string requestedPath) {
+    auto nodeTree = objectField(payload, "nodes", JSONValue.emptyObject);
+    ulong[] matches;
+    findPartUuidsByPsdPath(nodeTree, requestedPath, matches);
+    if (matches.length == 0) {
+        throw new Exception(format(
+            "Could not find Part with psdLayerPath '%s'.",
+            requestedPath
+        ));
+    }
+    if (matches.length > 1) {
+        throw new Exception(format(
+            "PSD layer path '%s' is ambiguous across %s Parts.",
+            requestedPath,
+            matches.length
+        ));
+    }
+    return matches[0];
+}
+
+ulong agentFindPartUuidByPsdPath(string inputPath, string requestedPath) {
+    auto document = parseInx(cast(const(ubyte)[]) read(inputPath));
+    return requirePartUuidByPsdPath(document.payload, requestedPath);
+}
+
 private size_t meshVertexCount(JSONValue mesh, string label) {
     auto vertices = requireMeshField(mesh, "verts");
     if (vertices.type != JSONType.array || vertices.array.length % 2 != 0) {
@@ -512,6 +588,25 @@ AgentMeshSummary agentReplacePartMesh(
 
     write(outputPath, serializeInx(document));
     return AgentMeshSummary(partUuid, vertexCount, triangleCount);
+}
+
+/**
+ * Replaces a Part mesh through the stable PSD hierarchy path retained by
+ * `psd-import`, avoiding generated UUID discovery in Agent workflows.
+ */
+AgentMeshSummary agentReplacePartMeshByPsdPath(
+    string inputPath,
+    string outputPath,
+    string psdLayerPath,
+    JSONValue requestedMesh
+) {
+    ulong partUuid = agentFindPartUuidByPsdPath(inputPath, psdLayerPath);
+    return agentReplacePartMesh(
+        inputPath,
+        outputPath,
+        partUuid,
+        requestedMesh
+    );
 }
 
 /**

@@ -4,6 +4,8 @@ authors "Inochi2D Project, pixelsama"
 license "BSD-2-Clause"
 
 dependency "inochi-agent-core" path="../agent-core"
+dependency "inochi2d" version="~>0.8.7"
+subConfiguration "inochi2d" "renderless"
 
 sourcePaths "source"
 mainSourceFile "source/inochi_agent/app.d"

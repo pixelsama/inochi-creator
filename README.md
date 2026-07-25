@@ -75,6 +75,10 @@ cd agent-cli
 dub run -- inspect model.inx
 dub run -- roundtrip input.inx output.inx
 dub run -- mesh-replace input.inx output.inx 42 replacement-mesh.json
+dub run -- mesh-replace-path input.inx output.inx /Eyes/Iris replacement-mesh.json
+dub run -- psd-inspect input.psd report.json
+dub run -- psd-import input.psd output.inx
+dub run -- sdk-validate output.inx
 ```
 
 `roundtrip` validates the entire container before writing and retains its bytes
@@ -87,10 +91,36 @@ a same-topology coordinate adjustment remains safe. The GUI uses the same
 validation boundary before it asks Inochi2D to instantiate a puppet and
 textures.
 
+`mesh-replace-path` applies the same guarded mesh mutation through the stable
+`psdLayerPath` retained by `psd-import`, so Agent workflows do not need to
+discover generated UUIDs. Missing or ambiguous paths are rejected.
+
+`psd-inspect` parses the Photoshop layer hierarchy and fully decodes every
+usable leaf layer into RGBA without creating a GPU texture. Its JSON report
+contains stable layer paths, bounds, visibility, channel/mask counts,
+transparent/translucent/opaque pixel totals, and a SHA-256 digest for each
+decoded layer. The source PSD is opened read-only.
+
+`psd-import` builds an initial parameter-free INX project directly from a PSD:
+groups become Nodes, pixel layers become texture-backed Parts, neutral
+placement and visibility/opacity/blending are retained, and every Part keeps a
+stable `psdLayerPath`. Each Part starts with the same four-vertex quad used by
+Creator's original PSD import. Before the final path is replaced, the command
+loads the temporary result through the official Inochi2D SDK in renderless
+mode. Unsupported semantics such as unapplied layer/vector masks, non-normal
+group blending, or group opacity fail explicitly rather than silently changing
+the neutral artwork.
+
+`sdk-validate` independently exercises that official SDK deserializer without
+opening a window or creating an OpenGL context. It verifies Part creation and
+all texture-slot references.
+
 For this Apple Silicon macOS development environment, the GUI build entry point
 is:
 
 ```sh
+./build-aux/osx/AgentCliBuild.sh test --config=application
+./build-aux/osx/AgentCliBuild.sh build --config=application
 ./build-aux/osx/AgentDevBuild.sh --build=debug
 ```
 
@@ -98,10 +128,11 @@ It expects LDC 1.41.0 in
 `~/.local/share/inochi-agent/toolchain/ldc2-1.41.0-osx-arm64`, or an alternate
 toolchain root through `INOCHI_AGENT_TOOLCHAIN`. The script locks the compatible
 Inochi2D, Numem, and i2d-imgui generations for this Creator revision, then
-builds an arm64 GUI. The renderer-independent container boundary is complete;
-the first semantic mutation command (per-Part mesh replacement) also runs
-without the GUI. Parameter, deformer, and PSD-import commands belong to the
-next Core extraction layers.
+builds an arm64 GUI. `AgentCliBuild.sh` applies the small upstream renderless
+guard required by Inochi2D 0.8.7 before building or testing the CLI. The
+renderer-independent container boundary is complete;
+per-Part mesh replacement and initial PSD import also run without the GUI.
+Parameter and deformer commands belong to the next Core extraction layers.
 
 ## Special Thanks
 
