@@ -1,0 +1,49 @@
+diff --git a/source/inochi2d/core/param/binding.d b/source/inochi2d/core/param/binding.d
+--- a/source/inochi2d/core/param/binding.d
++++ b/source/inochi2d/core/param/binding.d
+@@ -302,7 +302,34 @@ public:
+     SerdeException deserializeFromFghj(Fghj data) {
+         data["node"].deserializeValue(this.nodeRef);
+         data["param_name"].deserializeValue(this.target.paramName);
+-        data["values"].deserializeValue(this.values);
++        uint xCount = parameter.axisPointCount(0);
++        uint yCount = parameter.axisPointCount(1);
++        /*
++            Deformation owns a numem vector.  Deserialize each value into its
++            final binding slot instead of going through the generic nested
++            array path, which can lose the owned offsets during assignment.
++        */
++        static if (is(T == Deformation)) {
++            auto rawValues = data["values"].byElement;
++            this.values.length = xCount;
++            foreach (x; 0 .. xCount) {
++                enforce(!rawValues.empty, "Mismatched X value count");
++                auto rawRow = rawValues.front;
++                rawValues.popFront();
++                auto row = rawRow.byElement;
++                this.values[x].length = yCount;
++                foreach (y; 0 .. yCount) {
++                    enforce(!row.empty, "Mismatched Y value count");
++                    auto error = this.values[x][y].deserializeFromFghj(row.front);
++                    row.popFront();
++                    if (error !is null) return error;
++                }
++                enforce(row.empty, "Mismatched Y value count");
++            }
++            enforce(rawValues.empty, "Mismatched X value count");
++        } else {
++            data["values"].deserializeValue(this.values);
++        }
+         data["isSet"].deserializeValue(this.isSet_);
+         auto mode = data["interpolate_mode"];
+         if (mode != Fghj.init) {
+@@ -311,9 +338,6 @@ public:
+             this.interpolateMode_ = InterpolateMode.Linear;
+         }
+ 
+-        uint xCount = parameter.axisPointCount(0);
+-        uint yCount = parameter.axisPointCount(1);
+-
+         enforce(this.values.length == xCount, "Mismatched X value count");
+         foreach(i; this.values) {
+             enforce(i.length == yCount, "Mismatched Y value count");

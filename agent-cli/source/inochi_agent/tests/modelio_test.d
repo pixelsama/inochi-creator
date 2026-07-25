@@ -2,13 +2,16 @@ module inochi_agent.tests.modelio_test;
 
 import std.bitmanip : bigEndianToNative, nativeToBigEndian;
 import std.file : exists, read, remove, write;
-import std.json : JSONValue, parseJSON;
+import std.json : JSONType, JSONValue, parseJSON;
 import std.path : buildPath;
 import std.process : environment;
 import std.string : representation;
+import std.stdio : writeln;
 
 import creator.agentcore.modelio;
+import creator.agentcore.psdimport;
 import inochi_agent.commands;
+import inochi_agent.sdkvalidate;
 
 private string testPath(string filename) {
     return buildPath(environment.get("TMPDIR", "/tmp"), filename);
@@ -94,6 +97,43 @@ private ubyte[] createFixtureWithDeformationBinding() {
     return result;
 }
 
+private ubyte[] createSdkFixture() {
+    AgentPsdImportLayer group;
+    group.name = "Eyes";
+    group.path = "/Eyes";
+    group.sourceIndex = 2;
+    group.depth = 0;
+    group.isGroup = true;
+    group.visible = true;
+
+    AgentPsdImportLayer iris;
+    iris.name = "Iris";
+    iris.path = "/Eyes/Iris";
+    iris.sourceIndex = 1;
+    iris.depth = 1;
+    iris.visible = true;
+    iris.left = 10;
+    iris.top = 10;
+    iris.width = 4;
+    iris.height = 4;
+    iris.opacity = 255;
+    iris.blendMode = "norm";
+    iris.rgba.length = 4 * 4 * 4;
+    foreach (pixel; 0 .. 16) {
+        iris.rgba[pixel * 4] = 120;
+        iris.rgba[pixel * 4 + 1] = 80;
+        iris.rgba[pixel * 4 + 2] = 200;
+        iris.rgba[pixel * 4 + 3] = 255;
+    }
+
+    AgentPsdImportDocument document;
+    document.width = 32;
+    document.height = 32;
+    document.sourceLayerRecordCount = 3;
+    document.layers = [group, iris];
+    return agentBuildInitialInx(document, "sdk-rig-fixture");
+}
+
 private ubyte[] binarySuffix(const(ubyte)[] document) {
     assert(document.length >= 12);
     ubyte[uint.sizeof] encodedLength = document[8 .. 8 + uint.sizeof];
@@ -129,6 +169,61 @@ private JSONValue alternativeTopologyMesh() {
     }`);
 }
 
+private JSONValue simpleRigSpec() {
+    return parseJSON(`{
+        "meshes":[
+            {"path":"/Eyes/Iris","columns":3,"rows":2}
+        ],
+        "parameters":[
+            {
+                "name":"EyeX",
+                "min":-1,
+                "max":1,
+                "default":0,
+                "keys":[-1,0,1],
+                "bindings":[
+                    {
+                        "path":"/Eyes/Iris",
+                        "property":"transform.t.x",
+                        "values":[-4,0,4]
+                    },
+                    {
+                        "path":"/Eyes/Iris",
+                        "property":"opacity",
+                        "values":[0.25,1,0.25]
+                    },
+                    {
+                        "path":"/Eyes/Iris",
+                        "property":"deform",
+                        "values":[
+                            {"profiles":[{"type":"tipX","amount":-2}]},
+                            null,
+                            {"profiles":[{"type":"tipX","amount":2}]}
+                        ]
+                    }
+                ]
+            }
+        ]
+    }`);
+}
+
+private JSONValue simplePoseSpec() {
+    return parseJSON(`{
+        "poses":[
+            {
+                "name":"left",
+                "parameters":{"EyeX":-1},
+                "probes":["/Eyes/Iris"]
+            },
+            {
+                "name":"right",
+                "parameters":{"EyeX":1},
+                "probes":["/Eyes/Iris"]
+            }
+        ]
+    }`);
+}
+
 unittest {
     string inputPath = testPath("inochi-agent-headless-input.inx");
     string outputPath = testPath("inochi-agent-headless-output.inx");
@@ -155,6 +250,120 @@ unittest {
     assert(exists(outputPath));
     assert(outputSummary == inputSummary);
     assert(cast(ubyte[]) read(outputPath) == fixture);
+}
+
+unittest {
+    string inputPath = testPath("inochi-agent-pose-input.inx");
+    string rigPath = testPath("inochi-agent-pose-rig.inx");
+
+    scope(exit) {
+        if (exists(inputPath)) remove(inputPath);
+        if (exists(rigPath)) remove(rigPath);
+    }
+
+    write(inputPath, createSdkFixture());
+    agentApplyRigSpec(inputPath, rigPath, simpleRigSpec());
+    string rerigPath = rigPath ~ ".rerig";
+    scope (exit) if (exists(rerigPath)) remove(rerigPath);
+    auto rerigSummary = agentApplyRigSpec(rigPath, rerigPath, simpleRigSpec());
+    assert(rerigSummary.parameterCount == 1);
+    assert(agentInspectModel(rerigPath).parameterCount == 1);
+
+    auto report = agentSamplePoses(rigPath, simplePoseSpec());
+    writeln(report.toJson());
+    assert(report.poseCount == 2);
+    assert(report.probeCount == 2);
+    assert(report.poses[0].name == "left");
+    assert(report.poses[1].name == "right");
+    assert(report.poses[0].probes[0].translationX < report.poses[1].probes[0].translationX);
+    assert(report.poses[0].probes[0].deformationMagnitude > 0);
+    assert(report.poses[1].probes[0].deformationMagnitude > 0);
+}
+
+unittest {
+    string inputPath = testPath("inochi-agent-pose-cli-input.inx");
+    string rigPath = testPath("inochi-agent-pose-cli-rig.inx");
+    string posePath = testPath("inochi-agent-pose-cli.json");
+
+    scope(exit) {
+        if (exists(inputPath)) remove(inputPath);
+        if (exists(rigPath)) remove(rigPath);
+        if (exists(posePath)) remove(posePath);
+    }
+
+    write(inputPath, createSdkFixture());
+    agentApplyRigSpec(inputPath, rigPath, simpleRigSpec());
+    write(posePath, simplePoseSpec().toString());
+
+    assert(runAgentCommand([
+        "inochi-agent",
+        "pose-sample",
+        rigPath,
+        posePath
+    ]) == 0);
+}
+
+unittest {
+    string inputPath = testPath("inochi-agent-rig-input.inx");
+    string outputPath = testPath("inochi-agent-rig-output.inx");
+
+    scope(exit) {
+        if (exists(inputPath)) remove(inputPath);
+        if (exists(outputPath)) remove(outputPath);
+    }
+
+    auto fixture = createFixture();
+    write(inputPath, fixture);
+
+    auto summary = agentApplyRigSpec(
+        inputPath,
+        outputPath,
+        simpleRigSpec()
+    );
+    assert(summary.meshedPartCount == 1);
+    assert(summary.parameterCount == 1);
+    assert(summary.bindingCount == 3);
+    assert(binarySuffix(cast(ubyte[]) read(outputPath)) == binarySuffix(fixture));
+
+    auto payload = agentReadModelPayload(outputPath);
+    auto part = payload["nodes"]["children"].array[0];
+    assert(part["mesh"]["verts"].array.length == 12);
+    assert(part["mesh"]["uvs"].array.length == 12);
+    assert(part["mesh"]["indices"].array.length == 12);
+    assert(part["enabled"].type == JSONType.true_);
+
+    auto parameter = payload["param"].array[$ - 1];
+    assert(parameter["name"].str == "EyeX");
+    assert(parameter["axis_points"].array[0].array.length == 3);
+    assert(parameter["bindings"].array.length == 3);
+    auto deformation = parameter["bindings"].array[2];
+    assert(deformation["values"].array.length == 3);
+    assert(deformation["values"].array[0].array[0].array.length == 6);
+}
+
+unittest {
+    string inputPath = testPath("inochi-agent-invalid-rig-input.inx");
+    string outputPath = testPath("inochi-agent-invalid-rig-output.inx");
+
+    scope(exit) {
+        if (exists(inputPath)) remove(inputPath);
+        if (exists(outputPath)) remove(outputPath);
+    }
+
+    auto fixture = createFixture();
+    write(inputPath, fixture);
+
+    auto invalid = simpleRigSpec();
+    invalid["parameters"].array[0]["keys"].array[1] = JSONValue(-1.0);
+    bool rejected;
+    try {
+        agentApplyRigSpec(inputPath, outputPath, invalid);
+    } catch (Exception) {
+        rejected = true;
+    }
+    assert(rejected);
+    assert(!exists(outputPath));
+    assert(cast(ubyte[]) read(inputPath) == fixture);
 }
 
 unittest {
@@ -386,4 +595,30 @@ unittest {
 
     auto payload = agentReadModelPayload(outputPath);
     assert(payload["nodes"]["children"].array[0]["mesh"]["indices"].array.length == 6);
+}
+
+unittest {
+    string inputPath = testPath("inochi-agent-cli-rig-input.inx");
+    string outputPath = testPath("inochi-agent-cli-rig-output.inx");
+    string specPath = testPath("inochi-agent-cli-rig.json");
+
+    scope(exit) {
+        if (exists(inputPath)) remove(inputPath);
+        if (exists(outputPath)) remove(outputPath);
+        if (exists(specPath)) remove(specPath);
+    }
+
+    write(inputPath, createSdkFixture());
+    write(specPath, simpleRigSpec().toString());
+
+    assert(runAgentCommand([
+        "inochi-agent",
+        "rig-apply",
+        inputPath,
+        outputPath,
+        specPath
+    ]) == 0);
+
+    auto payload = agentReadModelPayload(outputPath);
+    assert(payload["param"].array.length == 1);
 }

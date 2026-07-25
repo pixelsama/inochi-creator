@@ -6,6 +6,7 @@ TOOLCHAIN_ROOT=${INOCHI_AGENT_TOOLCHAIN:-"$HOME/.local/share/inochi-agent/toolch
 DEPS_ROOT=${INOCHI_AGENT_DEPS_ROOT:-"$ROOT/.agent-deps"}
 INOCHI2D_DIR="$DEPS_ROOT/inochi2d-0.8.7"
 INOCHI2D_RENDERLESS_PATCH="$ROOT/build-aux/osx/patches/inochi2d-renderless-composite.patch"
+INOCHI2D_DEFORMATION_PATCH="$ROOT/build-aux/osx/patches/inochi2d-deformation-deserialize.patch"
 
 if [ ! -x "$TOOLCHAIN_ROOT/bin/ldc2" ]; then
     echo "LDC was not found at $TOOLCHAIN_ROOT/bin/ldc2." >&2
@@ -25,8 +26,23 @@ if git -C "$INOCHI2D_DIR" apply --reverse --check "$INOCHI2D_RENDERLESS_PATCH" >
     :
 elif git -C "$INOCHI2D_DIR" apply --check "$INOCHI2D_RENDERLESS_PATCH" >/dev/null 2>&1; then
     git -C "$INOCHI2D_DIR" apply "$INOCHI2D_RENDERLESS_PATCH"
+elif grep -q 'version (InDoesRender)' \
+    "$INOCHI2D_DIR/source/inochi2d/core/nodes/composite/package.d"; then
+    :
 else
     echo "The Inochi2D renderless patch does not match $INOCHI2D_DIR." >&2
+    exit 1
+fi
+
+if git -C "$INOCHI2D_DIR" apply --reverse --check "$INOCHI2D_DEFORMATION_PATCH" >/dev/null 2>&1; then
+    :
+elif git -C "$INOCHI2D_DIR" apply --check "$INOCHI2D_DEFORMATION_PATCH" >/dev/null 2>&1; then
+    git -C "$INOCHI2D_DIR" apply "$INOCHI2D_DEFORMATION_PATCH"
+elif grep -q 'Deserialize each value into its' \
+    "$INOCHI2D_DIR/source/inochi2d/core/param/binding.d"; then
+    :
+else
+    echo "The Inochi2D deformation deserialization patch does not match $INOCHI2D_DIR." >&2
     exit 1
 fi
 

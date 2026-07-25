@@ -16,6 +16,8 @@ private void printUsage() {
     writeln("  inochi-agent roundtrip <input.inx> <output.inx>");
     writeln("  inochi-agent mesh-replace <input.inx> <output.inx> <part-uuid> <mesh.json>");
     writeln("  inochi-agent mesh-replace-path <input.inx> <output.inx> <psd-layer-path> <mesh.json>");
+    writeln("  inochi-agent rig-apply <input.inx> <output.inx> <rig.json>");
+    writeln("  inochi-agent pose-sample <model.inx> <poses.json>");
     writeln("  inochi-agent psd-inspect <input.psd> <report.json>");
     writeln("  inochi-agent psd-import <input.psd> <output.inx>");
     writeln("  inochi-agent sdk-validate <model.inx>");
@@ -56,6 +58,26 @@ int runAgentCommand(string[] args) {
             mesh
         );
         writeln(summary.toJson());
+        return 0;
+    }
+
+    if (args.length == 5 && args[1] == "rig-apply") {
+        string temporaryPath = args[3] ~ ".agent-incomplete";
+        if (exists(temporaryPath)) remove(temporaryPath);
+        scope (failure) if (exists(temporaryPath)) remove(temporaryPath);
+
+        auto specification = parseJSON(cast(string) read(args[4]));
+        auto rigSummary = agentApplyRigSpec(args[2], temporaryPath, specification);
+        auto sdkSummary = agentValidateWithSdk(temporaryPath);
+        rename(temporaryPath, args[3]);
+        writeln(rigSummary.toJson());
+        writeln(sdkSummary.toJson());
+        return 0;
+    }
+
+    if (args.length == 4 && args[1] == "pose-sample") {
+        auto specification = parseJSON(cast(string) read(args[3]));
+        writeln(agentSamplePoses(args[2], specification).toJson());
         return 0;
     }
 
