@@ -1,0 +1,10 @@
+name "inochi-agent-core"
+description "Headless model container operations shared by Inochi Creator GUI and Agent CLI"
+authors "Inochi2D Project, pixelsama"
+license "BSD-2-Clause"
+
+sourcePaths "source"
+
+configuration "library" {
+    targetType "library"
+}

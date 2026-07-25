@@ -1,4 +1,5 @@
 .dub
+.agent-deps/
 docs.json
 __dummy.html
 docs/
@@ -39,3 +40,7 @@ build-aux/windows/wix/packages
 build-aux/windows/wix/.vs
 build-aux/windows/wix/bin
 *.msi
+
+# Agent Core/CLI build products
+/agent-cli/inochi-agent*
+/agent-core/*.a

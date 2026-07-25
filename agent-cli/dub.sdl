@@ -1,0 +1,14 @@
+name "inochi-agent"
+description "Headless Agent CLI for Inochi Creator projects"
+authors "Inochi2D Project, pixelsama"
+license "BSD-2-Clause"
+
+dependency "inochi-agent-core" path="../agent-core"
+
+sourcePaths "source"
+mainSourceFile "source/inochi_agent/app.d"
+
+configuration "application" {
+    targetType "executable"
+    targetName "inochi-agent"
+}

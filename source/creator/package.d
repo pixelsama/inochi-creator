@@ -24,6 +24,7 @@ public import creator.ver;
 public import creator.atlas;
 public import creator.io;
 import creator.core.colorbleed;
+import creator.agentcore.modelio : agentValidateModel;
 
 import std.path;
 import std.format;
@@ -241,8 +242,10 @@ bool incOpenProject(string mainPath, string backupPath) {
     // Load the puppet from file
     try {
         if (backupPath.length > 0) {
+            agentValidateModel(backupPath);
             puppet = inLoadPuppet!ExPuppet(backupPath);
         } else {
+            agentValidateModel(mainPath);
             puppet = inLoadPuppet!ExPuppet(mainPath);
         }
     } catch (FileException ex) {

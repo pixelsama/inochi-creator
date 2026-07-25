@@ -1,0 +1,15 @@
+diff --git a/deps/CMakeLists.txt b/deps/CMakeLists.txt
+index c5ac9e0..8d64b93 100644
+--- a/deps/CMakeLists.txt
++++ b/deps/CMakeLists.txt
+@@ -32,5 +32,9 @@ elseif (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+     set(PlatformFolder "darwin")
+-    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
++    if (DEFINED ENV{INOCHI_AGENT_OSX_ARCHITECTURES})
++        set(CMAKE_OSX_ARCHITECTURES "$ENV{INOCHI_AGENT_OSX_ARCHITECTURES}")
++    else ()
++        set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
++    endif ()
+ 
+     # This is neccesary to avoid macports/homebrew libraries to be seen
+     # these break universal builds.

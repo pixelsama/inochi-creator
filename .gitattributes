@@ -1,0 +1,1 @@
+build-aux/osx/patches/*.patch -whitespace

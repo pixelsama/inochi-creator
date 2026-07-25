@@ -62,8 +62,41 @@ Once the below dependencies are met, building and running inochi-creator should 
 - Freetype (developer package)
 - appimagetool (for building an AppImage)
 
+### Agent Core and Apple Silicon development
+
+This fork adds a deliberately renderer-free `agent-core` package and an
+`agent-cli` executable. They validate and inspect an `.inx` container without
+SDL, OpenGL, ImGui, a window, or `computer use`.
+
+The initial stable command surface is:
+
+```sh
+cd agent-cli
+dub run -- inspect model.inx
+dub run -- roundtrip input.inx output.inx
+```
+
+`roundtrip` validates the entire container before writing and retains its bytes
+unchanged. The GUI uses the same validation boundary before it asks Inochi2D to
+instantiate a puppet and textures.
+
+For this Apple Silicon macOS development environment, the GUI build entry point
+is:
+
+```sh
+./build-aux/osx/AgentDevBuild.sh --build=debug
+```
+
+It expects LDC 1.41.0 in
+`~/.local/share/inochi-agent/toolchain/ldc2-1.41.0-osx-arm64`, or an alternate
+toolchain root through `INOCHI_AGENT_TOOLCHAIN`. The script locks the compatible
+Inochi2D, Numem, and i2d-imgui generations for this Creator revision, then
+builds an arm64 GUI. The renderer-independent container boundary is complete;
+semantic mutation commands for meshes, parameters, deformers, and PSD import
+belong to the next Core extraction layer.
+
 ## Special Thanks
 
 This project is funded through [NGI0 Entrust](https://nlnet.nl/entrust), a fund established by [NLnet](https://nlnet.nl) with financial support from the European Commission's [Next Generation Internet](https://ngi.eu) program. Learn more at the [NLnet project page](https://nlnet.nl/project/Inochi2D).
 
-[<img src="https://nlnet.nl/logo/banner.svg" alt="NLnet foundation logo" width="20%" />](https://nlnet.nl)  
+[<img src="https://nlnet.nl/logo/banner.svg" alt="NLnet foundation logo" width="20%" />](https://nlnet.nl)
