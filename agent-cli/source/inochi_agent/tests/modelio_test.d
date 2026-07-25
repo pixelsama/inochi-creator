@@ -1,7 +1,7 @@
 module inochi_agent.tests.modelio_test;
 
 import std.bitmanip : bigEndianToNative, nativeToBigEndian;
-import std.file : exists, read, remove, write;
+import std.file : exists, read, remove, rmdirRecurse, write;
 import std.json : JSONType, JSONValue, parseJSON;
 import std.path : buildPath;
 import std.process : environment;
@@ -11,6 +11,7 @@ import std.stdio : writeln;
 import creator.agentcore.modelio;
 import creator.agentcore.psdimport;
 import inochi_agent.commands;
+import inochi_agent.cpurender;
 import inochi_agent.sdkvalidate;
 
 private string testPath(string filename) {
@@ -123,7 +124,7 @@ private ubyte[] createSdkFixture() {
         iris.rgba[pixel * 4] = 120;
         iris.rgba[pixel * 4 + 1] = 80;
         iris.rgba[pixel * 4 + 2] = 200;
-        iris.rgba[pixel * 4 + 3] = 255;
+        iris.rgba[pixel * 4 + 3] = 128;
     }
 
     AgentPsdImportDocument document;
@@ -224,6 +225,24 @@ private JSONValue simplePoseSpec() {
     }`);
 }
 
+private JSONValue simpleRenderSpec() {
+    return parseJSON(`{
+        "canvas":{"width":32,"height":32},
+        "poses":[
+            {
+                "name":"neutral",
+                "parameters":{"EyeX":0},
+                "probes":["/Eyes/Iris"]
+            },
+            {
+                "name":"right",
+                "parameters":{"EyeX":1},
+                "probes":["/Eyes/Iris"]
+            }
+        ]
+    }`);
+}
+
 unittest {
     string inputPath = testPath("inochi-agent-headless-input.inx");
     string outputPath = testPath("inochi-agent-headless-output.inx");
@@ -300,6 +319,55 @@ unittest {
         "pose-sample",
         rigPath,
         posePath
+    ]) == 0);
+}
+
+unittest {
+    import imagefmt : read_image;
+
+    string inputPath = testPath("inochi-agent-render-input.inx");
+    string rigPath = testPath("inochi-agent-render-rig.inx");
+    string specPath = testPath("inochi-agent-render-poses.json");
+    string outputDirectory = testPath("inochi-agent-render-output");
+
+    scope(exit) {
+        if (exists(inputPath)) remove(inputPath);
+        if (exists(rigPath)) remove(rigPath);
+        if (exists(specPath)) remove(specPath);
+        if (exists(outputDirectory)) rmdirRecurse(outputDirectory);
+    }
+
+    write(inputPath, createSdkFixture());
+    agentApplyRigSpec(inputPath, rigPath, simpleRigSpec());
+    write(specPath, simpleRenderSpec().toString());
+
+    auto report = agentRenderPoses(rigPath, simpleRenderSpec(), outputDirectory);
+    assert(report.poseCount == 2);
+    assert(report.poses[0].name == "neutral");
+    assert(report.poses[1].name == "right");
+    assert(report.poses[0].nonTransparentPixelCount > 0);
+    assert(report.poses[1].nonTransparentPixelCount > 0);
+    assert(report.poses[0].rgbaSha256 != report.poses[1].rgbaSha256);
+    assert(exists(report.poses[0].outputPath));
+    assert(exists(report.poses[1].outputPath));
+
+    auto neutral = read_image(report.poses[0].outputPath, 4, 8);
+    scope(exit) neutral.free();
+    assert(neutral.e == 0);
+    assert(neutral.w == 32);
+    assert(neutral.h == 32);
+    size_t center = cast(size_t) (11 * neutral.w + 11) * 4;
+    assert(neutral.buf8[center] >= 118 && neutral.buf8[center] <= 121);
+    assert(neutral.buf8[center + 1] >= 78 && neutral.buf8[center + 1] <= 81);
+    assert(neutral.buf8[center + 2] >= 198 && neutral.buf8[center + 2] <= 201);
+    assert(neutral.buf8[center + 3] >= 127 && neutral.buf8[center + 3] <= 129);
+
+    assert(runAgentCommand([
+        "inochi-agent",
+        "pose-render",
+        rigPath,
+        specPath,
+        outputDirectory
     ]) == 0);
 }
 

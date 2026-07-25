@@ -8,6 +8,7 @@ import std.stdio : writeln;
 import creator.agentcore.modelio;
 import creator.agentcore.psdimport;
 import creator.agentcore.psdinspect;
+import inochi_agent.cpurender;
 import inochi_agent.sdkvalidate;
 
 private void printUsage() {
@@ -18,6 +19,7 @@ private void printUsage() {
     writeln("  inochi-agent mesh-replace-path <input.inx> <output.inx> <psd-layer-path> <mesh.json>");
     writeln("  inochi-agent rig-apply <input.inx> <output.inx> <rig.json>");
     writeln("  inochi-agent pose-sample <model.inx> <poses.json>");
+    writeln("  inochi-agent pose-render <model.inx> <poses.json> <output-dir>");
     writeln("  inochi-agent psd-inspect <input.psd> <report.json>");
     writeln("  inochi-agent psd-import <input.psd> <output.inx>");
     writeln("  inochi-agent sdk-validate <model.inx>");
@@ -78,6 +80,12 @@ int runAgentCommand(string[] args) {
     if (args.length == 4 && args[1] == "pose-sample") {
         auto specification = parseJSON(cast(string) read(args[3]));
         writeln(agentSamplePoses(args[2], specification).toJson());
+        return 0;
+    }
+
+    if (args.length == 5 && args[1] == "pose-render") {
+        auto specification = parseJSON(cast(string) read(args[3]));
+        writeln(agentRenderPoses(args[2], specification, args[4]).toJson());
         return 0;
     }
 
