@@ -74,11 +74,18 @@ The initial stable command surface is:
 cd agent-cli
 dub run -- inspect model.inx
 dub run -- roundtrip input.inx output.inx
+dub run -- mesh-replace input.inx output.inx 42 replacement-mesh.json
 ```
 
 `roundtrip` validates the entire container before writing and retains its bytes
-unchanged. The GUI uses the same validation boundary before it asks Inochi2D to
-instantiate a puppet and textures.
+unchanged. `mesh-replace` validates an INX-native mesh JSON object
+(`verts`/`uvs`/`indices`/`origin`), normalizes triangle winding, replaces only
+the selected Part UUID's `mesh`, and retains all texture and extension payload
+bytes unchanged. When the Part already has a `deform` parameter binding, a
+vertex-count change is rejected until a deformation migration command exists;
+a same-topology coordinate adjustment remains safe. The GUI uses the same
+validation boundary before it asks Inochi2D to instantiate a puppet and
+textures.
 
 For this Apple Silicon macOS development environment, the GUI build entry point
 is:
@@ -92,8 +99,9 @@ It expects LDC 1.41.0 in
 toolchain root through `INOCHI_AGENT_TOOLCHAIN`. The script locks the compatible
 Inochi2D, Numem, and i2d-imgui generations for this Creator revision, then
 builds an arm64 GUI. The renderer-independent container boundary is complete;
-semantic mutation commands for meshes, parameters, deformers, and PSD import
-belong to the next Core extraction layer.
+the first semantic mutation command (per-Part mesh replacement) also runs
+without the GUI. Parameter, deformer, and PSD-import commands belong to the
+next Core extraction layers.
 
 ## Special Thanks
 
