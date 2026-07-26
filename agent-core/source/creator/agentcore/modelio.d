@@ -54,15 +54,17 @@ struct AgentMeshSummary {
 struct AgentRigSummary {
     size_t groupCount;
     size_t meshedPartCount;
+    size_t maskCount;
     size_t parameterCount;
     size_t bindingCount;
     size_t physicsCount;
 
     string toJson() const {
         return format(
-            `{"groupCount":%s,"meshedPartCount":%s,"parameterCount":%s,"bindingCount":%s,"physicsCount":%s}`,
+            `{"groupCount":%s,"meshedPartCount":%s,"maskCount":%s,"parameterCount":%s,"bindingCount":%s,"physicsCount":%s}`,
             groupCount,
             meshedPartCount,
+            maskCount,
             parameterCount,
             bindingCount,
             physicsCount
@@ -1257,6 +1259,101 @@ private void inspectRigTarget(
     });
 }
 
+private void applyRigMasks(
+    ref JSONValue payload,
+    JSONValue masks,
+    ref AgentRigSummary summary
+) {
+    if (masks.type != JSONType.array) {
+        throw new Exception("Rig specification masks must be an array.");
+    }
+
+    foreach (maskIndex, maskRequest; masks.array) {
+        string label = format("Mask request %s", maskIndex);
+        string targetPath = requiredString(maskRequest, "target", label);
+        string sourcePath = requiredString(maskRequest, "source", label);
+        string mode = requiredString(maskRequest, "mode", label);
+        if (mode == "mask") mode = "Mask";
+        if (mode == "dodge_mask" || mode == "dodge") mode = "DodgeMask";
+        if (mode != "Mask" && mode != "DodgeMask") {
+            throw new Exception(format(
+                "%s mode must be mask or dodge_mask.",
+                label
+            ));
+        }
+
+        ulong sourceUuid;
+        string sourceType;
+        JSONValue sourceMesh;
+        inspectRigTarget(
+            payload,
+            sourcePath,
+            sourceUuid,
+            sourceType,
+            sourceMesh
+        );
+        if (sourceType != "Part") {
+            throw new Exception(format(
+                "%s source '%s' is not a Part.",
+                label,
+                sourcePath
+            ));
+        }
+
+        mutateUniqueNode(payload, targetPath, (ref JSONValue target) {
+            if (objectField(target, "type", JSONValue("")).str != "Part") {
+                throw new Exception(format(
+                    "%s target '%s' is not a Part.",
+                    label,
+                    targetPath
+                ));
+            }
+            auto targetUuid = readIndex(
+                objectField(target, "uuid", JSONValue(0)),
+                format("%s target uuid", label)
+            );
+            if (targetUuid == sourceUuid) {
+                throw new Exception(format(
+                    "%s cannot mask a Part with itself.",
+                    label
+                ));
+            }
+
+            auto existingMasks = objectField(
+                target,
+                "masks",
+                JSONValue(JSONValue[].init)
+            );
+            if (existingMasks.type != JSONType.array) {
+                throw new Exception(format(
+                    "%s target masks must be an array.",
+                    label
+                ));
+            }
+
+            foreach (existing; existingMasks.array) {
+                if (
+                    existing.type == JSONType.object &&
+                    "source" in existing.object &&
+                    "mode" in existing.object &&
+                    readIndex(existing["source"], label ~ " existing source") == sourceUuid &&
+                    existing["mode"].type == JSONType.string &&
+                    existing["mode"].str == mode
+                ) {
+                    return;
+                }
+            }
+
+            JSONValue[string] binding;
+            binding["source"] = JSONValue(sourceUuid);
+            binding["mode"] = JSONValue(mode);
+            existingMasks.array ~= JSONValue(binding);
+            target.object["masks"] = existingMasks;
+            summary.maskCount++;
+        });
+    }
+}
+
 private ulong maximumUuid(JSONValue node, JSONValue parameters) {
     ulong result;
     void scanNode(JSONValue current) {
@@ -1499,6 +1596,17 @@ AgentRigSummary agentApplyRigSpec(
         groups,
         summary,
         nextUuid
+    );
+
+    auto masks = objectField(
+        specification,
+        "masks",
+        JSONValue(JSONValue[].init)
+    );
+    applyRigMasks(
+        document.payload,
+        masks,
+        summary
     );
 
     auto meshes = objectField(specification, "meshes", JSONValue(JSONValue[].init));

@@ -164,6 +164,55 @@ private ubyte[] createFlatSdkFixture() {
     return agentBuildInitialInx(document, "flat-rig-fixture");
 }
 
+private ubyte[] createMaskSdkFixture() {
+    AgentPsdImportLayer sclera;
+    sclera.name = "Sclera";
+    sclera.path = "/Sclera";
+    sclera.sourceIndex = 1;
+    sclera.depth = 0;
+    sclera.visible = true;
+    sclera.left = 12;
+    sclera.top = 12;
+    sclera.width = 2;
+    sclera.height = 2;
+    sclera.opacity = 255;
+    sclera.blendMode = "norm";
+    sclera.rgba.length = 2 * 2 * 4;
+    foreach (pixel; 0 .. 4) {
+        sclera.rgba[pixel * 4] = 255;
+        sclera.rgba[pixel * 4 + 1] = 255;
+        sclera.rgba[pixel * 4 + 2] = 255;
+        sclera.rgba[pixel * 4 + 3] = 255;
+    }
+
+    AgentPsdImportLayer iris;
+    iris.name = "Iris";
+    iris.path = "/Iris";
+    iris.sourceIndex = 2;
+    iris.depth = 0;
+    iris.visible = true;
+    iris.left = 10;
+    iris.top = 10;
+    iris.width = 6;
+    iris.height = 6;
+    iris.opacity = 255;
+    iris.blendMode = "norm";
+    iris.rgba.length = 6 * 6 * 4;
+    foreach (pixel; 0 .. 36) {
+        iris.rgba[pixel * 4] = 120;
+        iris.rgba[pixel * 4 + 1] = 80;
+        iris.rgba[pixel * 4 + 2] = 200;
+        iris.rgba[pixel * 4 + 3] = 255;
+    }
+
+    AgentPsdImportDocument document;
+    document.width = 32;
+    document.height = 32;
+    document.sourceLayerRecordCount = 2;
+    document.layers = [sclera, iris];
+    return agentBuildInitialInx(document, "mask-rig-fixture");
+}
+
 private ubyte[] binarySuffix(const(ubyte)[] document) {
     assert(document.length >= 12);
     ubyte[uint.sizeof] encodedLength = document[8 .. 8 + uint.sizeof];
@@ -299,6 +348,18 @@ private JSONValue physicsRigSpec() {
                 "length_damping":0.7,
                 "output_scale":[6,0],
                 "local_only":false
+            }
+        ]
+    }`);
+}
+
+private JSONValue maskRigSpec() {
+    return parseJSON(`{
+        "masks":[
+            {
+                "target":"/Iris",
+                "source":"/Sclera",
+                "mode":"mask"
             }
         ]
     }`);
@@ -478,6 +539,59 @@ unittest {
         specPath,
         outputDirectory
     ]) == 0);
+}
+
+unittest {
+    import imagefmt : read_image;
+
+    string inputPath = testPath("inochi-agent-mask-input.inx");
+    string rigPath = testPath("inochi-agent-mask-rig.inx");
+    string outputDirectory = testPath("inochi-agent-mask-render-output");
+
+    scope(exit) {
+        if (exists(inputPath)) remove(inputPath);
+        if (exists(rigPath)) remove(rigPath);
+        if (exists(outputDirectory)) rmdirRecurse(outputDirectory);
+    }
+
+    write(inputPath, createMaskSdkFixture());
+    auto summary = agentApplyRigSpec(inputPath, rigPath, maskRigSpec());
+    assert(summary.maskCount == 1);
+    agentValidateWithSdk(rigPath);
+
+    auto payload = agentReadModelPayload(rigPath);
+    auto rootChildren = payload["nodes"]["children"].array;
+    auto sclera = rootChildren[0];
+    auto iris = rootChildren[1];
+    assert(iris["masks"].array.length == 1);
+    assert(iris["masks"].array[0]["source"] == sclera["uuid"]);
+    assert(iris["masks"].array[0]["mode"].str == "Mask");
+
+    auto report = agentRenderPoses(
+        rigPath,
+        parseJSON(`{
+            "canvas":{"width":32,"height":32},
+            "poses":[{"name":"masked","parameters":{}}]
+        }`),
+        outputDirectory
+    );
+    auto rendered = read_image(report.poses[0].outputPath, 4, 8);
+    scope(exit) rendered.free();
+    assert(rendered.e == 0);
+
+    size_t outsideMask = cast(size_t) (10 * rendered.w + 10) * 4;
+    size_t insideMask = cast(size_t) (12 * rendered.w + 12) * 4;
+    assert(rendered.buf8[outsideMask + 3] == 0);
+    assert(rendered.buf8[insideMask + 3] > 0);
+    assert(rendered.buf8[insideMask] >= 118 && rendered.buf8[insideMask] <= 121);
+    assert(
+        rendered.buf8[insideMask + 1] >= 78 &&
+        rendered.buf8[insideMask + 1] <= 81
+    );
+    assert(
+        rendered.buf8[insideMask + 2] >= 198 &&
+        rendered.buf8[insideMask + 2] <= 201
+    );
 }
 
 unittest {

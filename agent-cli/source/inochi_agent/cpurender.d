@@ -13,6 +13,7 @@ import std.string : replace, split;
 import imagefmt : IF_ERROR, read_image, write_image;
 import inochi2d : Node, Part, Puppet, inClearUUIDs, inInit, inLoadINPPuppet,
     inSetTimingFunc, inUpdate;
+import inochi2d.core.nodes.common : MaskingMode;
 import inochi2d.math : mat4, vec2, vec4;
 
 import creator.agentcore.modelio : AgentTextureBlob, agentReadModelTextures;
@@ -255,6 +256,47 @@ private ubyte[] straightAlphaCopy(const(ubyte)[] premultiplied) {
     return result;
 }
 
+private void blendPremultipliedCanvas(
+    ref ubyte[] destination,
+    const(ubyte)[] source
+) {
+    if (destination.length != source.length) {
+        throw new Exception("Premultiplied canvas dimensions do not match.");
+    }
+    foreach (pixel; 0 .. destination.length / 4) {
+        size_t offset = pixel * 4;
+        float sourceAlpha = source[offset + 3] / 255.0f;
+        if (sourceAlpha <= 0) continue;
+        float inverseSourceAlpha = 1 - sourceAlpha;
+        foreach (channel; 0 .. 3) {
+            float sourcePremultiplied = source[offset + channel] / 255.0f;
+            float destinationPremultiplied =
+                destination[offset + channel] / 255.0f;
+            destination[offset + channel] = cast(ubyte) clamp(
+                cast(int) (
+                    (sourcePremultiplied +
+                        destinationPremultiplied * inverseSourceAlpha) *
+                    255 +
+                    0.5f
+                ),
+                0,
+                255
+            );
+        }
+        float destinationAlpha = destination[offset + 3] / 255.0f;
+        destination[offset + 3] = cast(ubyte) clamp(
+            cast(int) (
+                (sourceAlpha +
+                    destinationAlpha * inverseSourceAlpha) *
+                255 +
+                0.5f
+            ),
+            0,
+            255
+        );
+    }
+}
+
 private void renderTriangle(
     ref ubyte[] canvas,
     int width,
@@ -312,6 +354,134 @@ private void renderTriangle(
     }
 }
 
+private void renderPartInto(
+    ref ubyte[] canvas,
+    Puppet puppet,
+    Part part,
+    ref DecodedTexture[] textures,
+    int width,
+    int height
+) {
+    if (!part.renderEnabled || part.textureIds.length == 0) return;
+    int textureId = part.textureIds[0];
+    if (textureId < 0 || textureId >= textures.length) {
+        throw new Exception(
+            format("Part '%s' references missing texture %s.", part.name, textureId)
+        );
+    }
+
+    auto mesh = part.getMesh();
+    if (
+        mesh.vertices.length == 0 ||
+        mesh.uvs.length != mesh.vertices.length ||
+        part.deformation.length != mesh.vertices.length ||
+        mesh.indices.length % 3 != 0
+    ) {
+        return;
+    }
+    mat4 matrix = puppet.transform.matrix * part.getDynamicMatrix();
+    vec2[] pixelVertices;
+    pixelVertices.length = mesh.vertices.length;
+    foreach (index, vertex; mesh.vertices) {
+        auto local = vertex - mesh.origin + part.deformation[index];
+        pixelVertices[index] = worldToPixel(
+            matrix * vec4(local, 0, 1),
+            width,
+            height
+        );
+    }
+
+    float opacity = part.opacity * part.getValue("opacity");
+    foreach (triangle; 0 .. mesh.indices.length / 3) {
+        auto i0 = mesh.indices[triangle * 3];
+        auto i1 = mesh.indices[triangle * 3 + 1];
+        auto i2 = mesh.indices[triangle * 3 + 2];
+        renderTriangle(
+            canvas,
+            width,
+            height,
+            textures[textureId],
+            pixelVertices[i0],
+            pixelVertices[i1],
+            pixelVertices[i2],
+            mesh.uvs[i0],
+            mesh.uvs[i1],
+            mesh.uvs[i2],
+            opacity
+        );
+    }
+}
+
+private void applyPartMasks(
+    ref ubyte[] target,
+    Puppet puppet,
+    Part part,
+    ref DecodedTexture[] textures,
+    int width,
+    int height
+) {
+    if (part.masks.length == 0) return;
+
+    bool hasPositiveMask;
+    auto combined = new float[cast(size_t) width * height];
+    combined[] = 0.0f;
+    foreach (binding; part.masks) {
+        auto maskPart = cast(Part) binding.maskSrc;
+        if (maskPart is null) continue;
+        auto maskCanvas = new ubyte[target.length];
+        renderPartInto(
+            maskCanvas,
+            puppet,
+            maskPart,
+            textures,
+            width,
+            height
+        );
+        if (binding.mode == MaskingMode.Mask) {
+            hasPositiveMask = true;
+            foreach (pixel; 0 .. combined.length) {
+                float alpha = maskCanvas[pixel * 4 + 3] / 255.0f;
+                combined[pixel] =
+                    1 - (1 - combined[pixel]) * (1 - alpha);
+            }
+        }
+    }
+
+    if (!hasPositiveMask) {
+        foreach (ref value; combined) value = 1;
+    }
+    foreach (binding; part.masks) {
+        if (binding.mode != MaskingMode.DodgeMask) continue;
+        auto maskPart = cast(Part) binding.maskSrc;
+        if (maskPart is null) continue;
+        auto maskCanvas = new ubyte[target.length];
+        renderPartInto(
+            maskCanvas,
+            puppet,
+            maskPart,
+            textures,
+            width,
+            height
+        );
+        foreach (pixel; 0 .. combined.length) {
+            float alpha = maskCanvas[pixel * 4 + 3] / 255.0f;
+            combined[pixel] *= 1 - alpha;
+        }
+    }
+
+    foreach (pixel; 0 .. combined.length) {
+        float alpha = clamp(combined[pixel], 0.0f, 1.0f);
+        size_t offset = pixel * 4;
+        foreach (channel; 0 .. 4) {
+            target[offset + channel] = cast(ubyte) clamp(
+                cast(int) (target[offset + channel] * alpha + 0.5f),
+                0,
+                255
+            );
+        }
+    }
+}
+
 private ubyte[] renderPuppet(
     Puppet puppet,
     ref DecodedTexture[] textures,
@@ -327,54 +497,24 @@ private ubyte[] renderPuppet(
 
     foreach (entry; parts) {
         auto part = entry.part;
-        if (!part.renderEnabled || part.textureIds.length == 0) continue;
-        int textureId = part.textureIds[0];
-        if (textureId < 0 || textureId >= textures.length) {
-            throw new Exception(
-                format("Part '%s' references missing texture %s.", part.name, textureId)
-            );
-        }
-
-        auto mesh = part.getMesh();
-        if (
-            mesh.vertices.length == 0 ||
-            mesh.uvs.length != mesh.vertices.length ||
-            part.deformation.length != mesh.vertices.length ||
-            mesh.indices.length % 3 != 0
-        ) {
-            continue;
-        }
-        mat4 matrix = puppet.transform.matrix * part.getDynamicMatrix();
-        vec2[] pixelVertices;
-        pixelVertices.length = mesh.vertices.length;
-        foreach (index, vertex; mesh.vertices) {
-            auto local = vertex - mesh.origin + part.deformation[index];
-            pixelVertices[index] = worldToPixel(
-                matrix * vec4(local, 0, 1),
-                width,
-                height
-            );
-        }
-
-        float opacity = part.opacity * part.getValue("opacity");
-        foreach (triangle; 0 .. mesh.indices.length / 3) {
-            auto i0 = mesh.indices[triangle * 3];
-            auto i1 = mesh.indices[triangle * 3 + 1];
-            auto i2 = mesh.indices[triangle * 3 + 2];
-            renderTriangle(
-                canvas,
-                width,
-                height,
-                textures[textureId],
-                pixelVertices[i0],
-                pixelVertices[i1],
-                pixelVertices[i2],
-                mesh.uvs[i0],
-                mesh.uvs[i1],
-                mesh.uvs[i2],
-                opacity
-            );
-        }
+        auto layer = new ubyte[canvas.length];
+        renderPartInto(
+            layer,
+            puppet,
+            part,
+            textures,
+            width,
+            height
+        );
+        applyPartMasks(
+            layer,
+            puppet,
+            part,
+            textures,
+            width,
+            height
+        );
+        blendPremultipliedCanvas(canvas, layer);
     }
     return canvas;
 }
