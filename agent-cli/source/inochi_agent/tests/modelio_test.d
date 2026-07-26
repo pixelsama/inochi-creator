@@ -135,6 +135,35 @@ private ubyte[] createSdkFixture() {
     return agentBuildInitialInx(document, "sdk-rig-fixture");
 }
 
+private ubyte[] createFlatSdkFixture() {
+    AgentPsdImportLayer iris;
+    iris.name = "Iris";
+    iris.path = "/Iris";
+    iris.sourceIndex = 1;
+    iris.depth = 0;
+    iris.visible = true;
+    iris.left = 10;
+    iris.top = 10;
+    iris.width = 4;
+    iris.height = 4;
+    iris.opacity = 255;
+    iris.blendMode = "norm";
+    iris.rgba.length = 4 * 4 * 4;
+    foreach (pixel; 0 .. 16) {
+        iris.rgba[pixel * 4] = 120;
+        iris.rgba[pixel * 4 + 1] = 80;
+        iris.rgba[pixel * 4 + 2] = 200;
+        iris.rgba[pixel * 4 + 3] = 128;
+    }
+
+    AgentPsdImportDocument document;
+    document.width = 32;
+    document.height = 32;
+    document.sourceLayerRecordCount = 1;
+    document.layers = [iris];
+    return agentBuildInitialInx(document, "flat-rig-fixture");
+}
+
 private ubyte[] binarySuffix(const(ubyte)[] document) {
     assert(document.length >= 12);
     ubyte[uint.sizeof] encodedLength = document[8 .. 8 + uint.sizeof];
@@ -203,6 +232,86 @@ private JSONValue simpleRigSpec() {
                         ]
                     }
                 ]
+            }
+        ]
+    }`);
+}
+
+private JSONValue groupedRigSpec() {
+    return parseJSON(`{
+        "groups":[
+            {
+                "name":"Eyes",
+                "paths":["/Iris"],
+                "zsort":4
+            }
+        ]
+    }`);
+}
+
+private JSONValue nestedGroupedRigSpec() {
+    return parseJSON(`{
+        "groups":[
+            {
+                "name":"Eyes",
+                "paths":["/Iris"],
+                "pivot":[2,3],
+                "zsort":4
+            },
+            {
+                "name":"BodyRoot",
+                "paths":["/Eyes"],
+                "pivot":[5,7],
+                "zsort":1
+            }
+        ]
+    }`);
+}
+
+private JSONValue physicsRigSpec() {
+    return parseJSON(`{
+        "parameters":[
+            {
+                "name":"Swing",
+                "min":-1,
+                "max":1,
+                "default":0,
+                "keys":[-1,0,1],
+                "bindings":[
+                    {
+                        "path":"/Eyes/Iris",
+                        "property":"transform.r.z",
+                        "values":[-0.1,0,0.1]
+                    }
+                ]
+            }
+        ],
+        "physics":[
+            {
+                "name":"SwingPhysics",
+                "parent":"/Eyes",
+                "parameter":"Swing",
+                "model_type":"Pendulum",
+                "map_mode":"AngleLength",
+                "length":100,
+                "frequency":1.5,
+                "angle_damping":0.7,
+                "length_damping":0.7,
+                "output_scale":[6,0],
+                "local_only":false
+            }
+        ]
+    }`);
+}
+
+private JSONValue physicsRenderSpec() {
+    return parseJSON(`{
+        "canvas":{"width":32,"height":32},
+        "poses":[
+            {
+                "name":"physics_neutral",
+                "parameters":{"Swing":0},
+                "physics":{"frames":8,"dt":0.0166666667}
             }
         ]
     }`);
@@ -689,4 +798,111 @@ unittest {
 
     auto payload = agentReadModelPayload(outputPath);
     assert(payload["param"].array.length == 1);
+}
+
+unittest {
+    string inputPath = testPath("inochi-agent-cli-group-input.inx");
+    string outputPath = testPath("inochi-agent-cli-group-output.inx");
+    string specPath = testPath("inochi-agent-cli-group.json");
+
+    scope(exit) {
+        if (exists(inputPath)) remove(inputPath);
+        if (exists(outputPath)) remove(outputPath);
+        if (exists(specPath)) remove(specPath);
+    }
+
+    write(inputPath, createFlatSdkFixture());
+    write(specPath, groupedRigSpec().toString());
+
+    assert(runAgentCommand([
+        "inochi-agent",
+        "rig-apply",
+        inputPath,
+        outputPath,
+        specPath
+    ]) == 0);
+
+    auto payload = agentReadModelPayload(outputPath);
+    auto rootChildren = payload["nodes"]["children"].array;
+    assert(rootChildren.length == 1);
+    assert(rootChildren[0]["type"].str == "Node");
+    assert(rootChildren[0]["name"].str == "Eyes");
+    assert(rootChildren[0]["children"].array.length == 1);
+    assert(rootChildren[0]["children"].array[0]["psdLayerPath"].str == "/Iris");
+}
+
+unittest {
+    string inputPath = testPath("inochi-agent-cli-nested-group-input.inx");
+    string outputPath = testPath("inochi-agent-cli-nested-group-output.inx");
+
+    scope(exit) {
+        if (exists(inputPath)) remove(inputPath);
+        if (exists(outputPath)) remove(outputPath);
+    }
+
+    write(inputPath, createFlatSdkFixture());
+    auto summary = agentApplyRigSpec(
+        inputPath,
+        outputPath,
+        nestedGroupedRigSpec()
+    );
+    assert(summary.groupCount == 2);
+
+    auto payload = agentReadModelPayload(outputPath);
+    auto bodyRoot = payload["nodes"]["children"].array[0];
+    assert(bodyRoot["name"].str == "BodyRoot");
+    assert(bodyRoot["children"].array.length == 1);
+    auto eyes = bodyRoot["children"].array[0];
+    assert(eyes["name"].str == "Eyes");
+    assert(eyes["children"].array.length == 1);
+    assert(eyes["children"].array[0]["psdLayerPath"].str == "/Iris");
+}
+
+unittest {
+    string inputPath = testPath("inochi-agent-cli-physics-input.inx");
+    string outputPath = testPath("inochi-agent-cli-physics-output.inx");
+
+    scope(exit) {
+        if (exists(inputPath)) remove(inputPath);
+        if (exists(outputPath)) remove(outputPath);
+    }
+
+    write(inputPath, createSdkFixture());
+    auto summary = agentApplyRigSpec(
+        inputPath,
+        outputPath,
+        physicsRigSpec()
+    );
+    assert(summary.physicsCount == 1);
+
+    auto sdkSummary = agentValidateWithSdk(outputPath);
+    assert(sdkSummary.driverCount == 1);
+    assert(sdkSummary.drivenParameterCount == 1);
+}
+
+unittest {
+    import imagefmt : read_image;
+
+    string inputPath = testPath("inochi-agent-cli-physics-render-input.inx");
+    string outputPath = testPath("inochi-agent-cli-physics-render-output.inx");
+    string outputDirectory = testPath("inochi-agent-cli-physics-render-output");
+
+    scope(exit) {
+        if (exists(inputPath)) remove(inputPath);
+        if (exists(outputPath)) remove(outputPath);
+        if (exists(outputDirectory)) rmdirRecurse(outputDirectory);
+    }
+
+    write(inputPath, createSdkFixture());
+    agentApplyRigSpec(inputPath, outputPath, physicsRigSpec());
+    auto report = agentRenderPoses(
+        outputPath,
+        physicsRenderSpec(),
+        outputDirectory
+    );
+    assert(report.poseCount == 1);
+    assert(report.poses[0].physicsFrameCount == 8);
+    assert(report.poses[0].physicsParameterValues.length == 1);
+    assert(report.poses[0].nonTransparentPixelCount > 0);
+    assert(exists(report.poses[0].outputPath));
 }

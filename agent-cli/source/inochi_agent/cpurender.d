@@ -11,7 +11,8 @@ import std.path : buildPath;
 import std.string : replace, split;
 
 import imagefmt : IF_ERROR, read_image, write_image;
-import inochi2d : Node, Part, Puppet, inClearUUIDs, inInit, inLoadINPPuppet;
+import inochi2d : Node, Part, Puppet, inClearUUIDs, inInit, inLoadINPPuppet,
+    inSetTimingFunc, inUpdate;
 import inochi2d.math : mat4, vec2, vec4;
 
 import creator.agentcore.modelio : AgentTextureBlob, agentReadModelTextures;
@@ -20,6 +21,8 @@ struct AgentRenderPoseSummary {
     string name;
     string outputPath;
     size_t nonTransparentPixelCount;
+    size_t physicsFrameCount;
+    double[] physicsParameterValues;
     string rgbaSha256;
 
     JSONValue toJson() const {
@@ -29,6 +32,12 @@ struct AgentRenderPoseSummary {
         object["nonTransparentPixelCount"] = JSONValue(
             cast(ulong) nonTransparentPixelCount
         );
+        object["physicsFrameCount"] = JSONValue(cast(ulong) physicsFrameCount);
+        JSONValue[] physicsValues;
+        foreach (value; physicsParameterValues) {
+            physicsValues ~= JSONValue(value);
+        }
+        object["physicsParameterValues"] = JSONValue(physicsValues);
         object["rgbaSha256"] = JSONValue(rgbaSha256);
         return JSONValue(object);
     }
@@ -65,6 +74,11 @@ private struct RenderPart {
 }
 
 private bool sdkInitialized;
+private double renderClock;
+
+private double renderClockValue() {
+    return renderClock;
+}
 
 private double readNumber(JSONValue value, string label) {
     double result;
@@ -365,6 +379,36 @@ private ubyte[] renderPuppet(
     return canvas;
 }
 
+private void setPoseParameters(
+    Puppet puppet,
+    JSONValue parameters,
+    string label
+) {
+    if (parameters.type != JSONType.object) {
+        throw new Exception(label ~ " requires a parameters object.");
+    }
+    foreach (name, value; parameters.object) {
+        auto parameterIndex = puppet.findParameterIndex(name);
+        if (parameterIndex < 0) {
+            throw new Exception("Pose references unknown parameter '" ~ name ~ "'.");
+        }
+        auto parameter = puppet.parameters[parameterIndex];
+        if (parameter.isVec2) {
+            throw new Exception(
+                "Pose rendering currently requires scalar parameter '" ~ name ~ "'."
+            );
+        }
+        double requested = readNumber(value, "Pose parameter '" ~ name ~ "'");
+        if (requested < parameter.min.x || requested > parameter.max.x) {
+            throw new Exception(
+                "Pose parameter '" ~ name ~ "' is outside its declared range."
+            );
+        }
+        parameter.value.x = cast(float) requested;
+        parameter.value.y = 0;
+    }
+}
+
 private void applyPose(Puppet puppet, JSONValue pose, size_t poseIndex) {
     string label = format("Pose %s", poseIndex);
     if (pose.type != JSONType.object) {
@@ -385,31 +429,72 @@ private void applyPose(Puppet puppet, JSONValue pose, size_t poseIndex) {
     }
 
     foreach (parameter; puppet.parameters) parameter.value = parameter.defaults;
-    foreach (name, value; pose["parameters"].object) {
-        auto parameterIndex = puppet.findParameterIndex(name);
-        if (parameterIndex < 0) {
-            throw new Exception("Pose references unknown parameter '" ~ name ~ "'.");
-        }
-        auto parameter = puppet.parameters[parameterIndex];
-        if (parameter.isVec2) {
-            throw new Exception(
-                "Pose rendering currently requires scalar parameter '" ~ name ~ "'."
-            );
-        }
-        double requested = readNumber(value, "Pose parameter '" ~ name ~ "'");
-        if (requested < parameter.min.x || requested > parameter.max.x) {
-            throw new Exception(
-                "Pose parameter '" ~ name ~ "' is outside its declared range."
-            );
-        }
-        parameter.value.x = cast(float) requested;
-        parameter.value.y = 0;
-    }
+    setPoseParameters(
+        puppet,
+        pose["parameters"],
+        label ~ " parameters"
+    );
+    puppet.update();
+}
 
-    puppet.root.beginUpdate();
-    foreach (parameter; puppet.parameters) parameter.update();
-    puppet.root.transformChanged();
-    puppet.root.update();
+private size_t simulatePhysics(Puppet puppet, JSONValue pose, size_t poseIndex) {
+    if (!("physics" in pose.object)) return 0;
+    auto physics = pose["physics"];
+    string label = format("Pose %s physics", poseIndex);
+    if (physics.type != JSONType.object) {
+        throw new Exception(label ~ " must be an object.");
+    }
+    size_t frames = 0;
+    double dt = 1.0 / 60.0;
+    if ("frames" in physics.object) {
+        frames = cast(size_t) readPositiveInteger(
+            physics["frames"],
+            label ~ " frames"
+        );
+    }
+    if ("dt" in physics.object) {
+        dt = readNumber(physics["dt"], label ~ " dt");
+        if (!isFinite(dt) || dt <= 0) {
+            throw new Exception(label ~ " dt must be positive and finite.");
+        }
+    }
+    if (frames == 0) return 0;
+
+    puppet.resetDrivers();
+    auto trajectory = physics.object.get("trajectory", JSONValue.init);
+    if (
+        trajectory.type != JSONType.null_ &&
+        trajectory.type != JSONType.array
+    ) {
+        throw new Exception(label ~ " trajectory must be an array.");
+    }
+    if (
+        trajectory.type == JSONType.array &&
+        trajectory.array.length != frames
+    ) {
+        throw new Exception(label ~ " trajectory length must equal frames.");
+    }
+    foreach (frame; 0 .. frames) {
+        if (trajectory.type == JSONType.array) {
+            setPoseParameters(
+                puppet,
+                trajectory.array[frame],
+                format("%s trajectory[%s]", label, frame)
+            );
+        }
+        renderClock += dt;
+        inUpdate();
+        puppet.update();
+    }
+    return frames;
+}
+
+private double[] physicsParameterValues(Puppet puppet) {
+    double[] values;
+    foreach (parameter, driver; puppet.getParameterDrivers()) {
+        values ~= parameter.value.x;
+    }
+    return values;
 }
 
 AgentRenderReport agentRenderPoses(
@@ -439,8 +524,11 @@ AgentRenderReport agentRenderPoses(
     int height = readPositiveInteger(canvas["height"], "Canvas height");
 
     if (!sdkInitialized) {
-        inInit(() => 0.0);
+        renderClock = 0;
+        inInit(&renderClockValue);
         sdkInitialized = true;
+    } else {
+        inSetTimingFunc(&renderClockValue);
     }
     inClearUUIDs();
     Puppet puppet = inLoadINPPuppet!Puppet(cast(ubyte[]) read(modelPath));
@@ -460,6 +548,7 @@ AgentRenderReport agentRenderPoses(
     report.height = height;
     foreach (poseIndex, pose; specification["poses"].array) {
         applyPose(puppet, pose, poseIndex);
+        auto physicsFrameCount = simulatePhysics(puppet, pose, poseIndex);
         auto premultiplied = renderPuppet(puppet, textures, width, height);
         auto rgba = straightAlphaCopy(premultiplied);
         string filename = format(
@@ -478,6 +567,8 @@ AgentRenderReport agentRenderPoses(
         AgentRenderPoseSummary poseSummary;
         poseSummary.name = pose["name"].str;
         poseSummary.outputPath = outputPath;
+        poseSummary.physicsFrameCount = physicsFrameCount;
+        poseSummary.physicsParameterValues = physicsParameterValues(puppet);
         foreach (pixel; 0 .. rgba.length / 4) {
             if (rgba[pixel * 4 + 3] > 0) poseSummary.nonTransparentPixelCount++;
         }

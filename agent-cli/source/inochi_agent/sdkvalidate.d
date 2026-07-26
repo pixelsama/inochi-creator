@@ -19,6 +19,8 @@ struct AgentSdkValidationSummary {
     size_t partCount;
     size_t textureSlotCount;
     size_t textureReferenceCount;
+    size_t driverCount;
+    size_t drivenParameterCount;
 
     string toJson() const {
         JSONValue[string] object;
@@ -26,6 +28,8 @@ struct AgentSdkValidationSummary {
         object["partCount"] = JSONValue(cast(ulong) partCount);
         object["textureSlotCount"] = JSONValue(cast(ulong) textureSlotCount);
         object["textureReferenceCount"] = JSONValue(cast(ulong) textureReferenceCount);
+        object["driverCount"] = JSONValue(cast(ulong) driverCount);
+        object["drivenParameterCount"] = JSONValue(cast(ulong) drivenParameterCount);
         return JSONValue(object).toString();
     }
 }
@@ -130,6 +134,8 @@ AgentSdkValidationSummary agentValidateWithSdk(string path) {
             summary.textureReferenceCount++;
         }
     }
+    summary.driverCount = puppet.getDrivers().length;
+    summary.drivenParameterCount = puppet.getParameterDrivers().length;
     return summary;
 }
 

@@ -52,16 +52,20 @@ struct AgentMeshSummary {
  * Summary of a deterministic rig specification application.
  */
 struct AgentRigSummary {
+    size_t groupCount;
     size_t meshedPartCount;
     size_t parameterCount;
     size_t bindingCount;
+    size_t physicsCount;
 
     string toJson() const {
         return format(
-            `{"meshedPartCount":%s,"parameterCount":%s,"bindingCount":%s}`,
+            `{"groupCount":%s,"meshedPartCount":%s,"parameterCount":%s,"bindingCount":%s,"physicsCount":%s}`,
+            groupCount,
             meshedPartCount,
             parameterCount,
-            bindingCount
+            bindingCount,
+            physicsCount
         );
     }
 }
@@ -214,6 +218,54 @@ private JSONValue objectField(JSONValue object, string key, JSONValue fallback) 
     if (object.type != JSONType.object) return fallback;
     if (key in object.object) return object[key];
     return fallback;
+}
+
+private JSONValue identityTransformJson() {
+    JSONValue[string] transform;
+    transform["trans"] = JSONValue([
+        JSONValue(0.0),
+        JSONValue(0.0),
+        JSONValue(0.0)
+    ]);
+    transform["rot"] = JSONValue([
+        JSONValue(0.0),
+        JSONValue(0.0),
+        JSONValue(0.0)
+    ]);
+    transform["scale"] = JSONValue([
+        JSONValue(1.0),
+        JSONValue(1.0)
+    ]);
+    return JSONValue(transform);
+}
+
+private JSONValue transformWithTranslation(double x, double y) {
+    auto transform = identityTransformJson();
+    transform.object["trans"] = JSONValue([
+        JSONValue(x),
+        JSONValue(y),
+        JSONValue(0.0)
+    ]);
+    return transform;
+}
+
+private void shiftNodeTranslation(ref JSONValue node, double dx, double dy) {
+    if (
+        node.type != JSONType.object ||
+        !("transform" in node.object) ||
+        node["transform"].type != JSONType.object ||
+        !("trans" in node["transform"].object) ||
+        node["transform"]["trans"].type != JSONType.array ||
+        node["transform"]["trans"].array.length < 2
+    ) {
+        throw new Exception("Rig node has no valid transform translation.");
+    }
+    node["transform"]["trans"].array[0] = JSONValue(
+        readFiniteNumber(node["transform"]["trans"].array[0], "Node translation x") + dx
+    );
+    node["transform"]["trans"].array[1] = JSONValue(
+        readFiniteNumber(node["transform"]["trans"].array[1], "Node translation y") + dy
+    );
 }
 
 private string requiredString(JSONValue object, string key, string label) {
@@ -746,6 +798,371 @@ private void mutateUniqueNode(
     }
 }
 
+private string childNodePath(string parentPath, JSONValue child) {
+    if (
+        child.type == JSONType.object &&
+        "name" in child.object &&
+        child["name"].type == JSONType.string &&
+        child["name"].str != "Root"
+    ) {
+        return parentPath ~ "/" ~ child["name"].str;
+    }
+    return parentPath;
+}
+
+/**
+ * Removes one uniquely addressed node from a node tree while preserving the
+ * stable PSD path stored on Parts.  Grouping is intentionally an identity
+ * operation: it changes only the parent/child relationship, never a Part's
+ * transform, mesh, texture, z-order, or pixels.
+ */
+private size_t extractNodeByPath(
+    ref JSONValue parent,
+    string parentPath,
+    string requestedPath,
+    out JSONValue extracted,
+    double shiftX = 0,
+    double shiftY = 0
+) {
+    if (
+        parent.type != JSONType.object ||
+        !("children" in parent.object) ||
+        parent["children"].type != JSONType.array
+    ) {
+        return 0;
+    }
+
+    JSONValue[] remaining;
+    size_t matches;
+    foreach (child; parent["children"].array) {
+        auto path = childNodePath(parentPath, child);
+        bool pathMatches = path == requestedPath;
+        if (
+            child.type == JSONType.object &&
+            "psdLayerPath" in child.object &&
+            child["psdLayerPath"].type == JSONType.string &&
+            child["psdLayerPath"].str == requestedPath
+        ) {
+            pathMatches = true;
+        }
+
+        if (pathMatches) {
+            matches++;
+            extracted = child;
+            shiftNodeTranslation(extracted, shiftX, shiftY);
+            continue;
+        }
+
+        auto nestedPath = path;
+        JSONValue nested;
+        auto nestedMatches = extractNodeByPath(
+            child,
+            nestedPath,
+            requestedPath,
+            nested,
+            shiftX,
+            shiftY
+        );
+        matches += nestedMatches;
+        if (nestedMatches > 0) {
+            extracted = nested;
+        }
+        remaining ~= child;
+    }
+    parent.object["children"] = JSONValue(remaining);
+    return matches;
+}
+
+private JSONValue buildAgentGroup(
+    ulong uuid,
+    string name,
+    JSONValue[] children,
+    double zsort,
+    double pivotX,
+    double pivotY
+) {
+    JSONValue[string] group;
+    group["uuid"] = JSONValue(uuid);
+    group["name"] = JSONValue(name);
+    group["type"] = JSONValue("Node");
+    group["enabled"] = JSONValue(true);
+    group["zsort"] = JSONValue(zsort);
+    group["transform"] = transformWithTranslation(pivotX, pivotY);
+    group["lockToRoot"] = JSONValue(false);
+    group["children"] = JSONValue(children);
+    return JSONValue(group);
+}
+
+private JSONValue buildSimplePhysicsNode(
+    ulong uuid,
+    string name,
+    ulong parameterUuid,
+    string modelType,
+    string mapMode,
+    double gravity,
+    double length,
+    double frequency,
+    double angleDamping,
+    double lengthDamping,
+    double outputScaleX,
+    double outputScaleY,
+    bool localOnly
+) {
+    JSONValue[string] node;
+    node["uuid"] = JSONValue(uuid);
+    node["name"] = JSONValue(name);
+    node["type"] = JSONValue("SimplePhysics");
+    node["enabled"] = JSONValue(true);
+    node["zsort"] = JSONValue(0.0);
+    node["transform"] = identityTransformJson();
+    node["lockToRoot"] = JSONValue(false);
+    node["children"] = JSONValue(JSONValue[].init);
+    node["param"] = JSONValue(parameterUuid);
+    node["model_type"] = JSONValue(modelType);
+    node["map_mode"] = JSONValue(mapMode);
+    node["gravity"] = JSONValue(gravity);
+    node["length"] = JSONValue(length);
+    node["frequency"] = JSONValue(frequency);
+    node["angle_damping"] = JSONValue(angleDamping);
+    node["length_damping"] = JSONValue(lengthDamping);
+    node["output_scale"] = JSONValue([
+        JSONValue(outputScaleX),
+        JSONValue(outputScaleY)
+    ]);
+    node["local_only"] = JSONValue(localOnly);
+    return JSONValue(node);
+}
+
+private ulong findParameterUuid(JSONValue parameters, string name) {
+    foreach (parameterIndex, parameter; parameters.array) {
+        if (
+            parameter.type == JSONType.object &&
+            "name" in parameter.object &&
+            parameter["name"].type == JSONType.string &&
+            parameter["name"].str == name
+        ) {
+            if (!("uuid" in parameter.object)) {
+                throw new Exception(format(
+                    "Parameter '%s' has no uuid.",
+                    name
+                ));
+            }
+            return readIndex(
+                parameter["uuid"],
+                format("Parameter '%s' uuid", name)
+            );
+        }
+    }
+    throw new Exception(format("Could not find parameter '%s'.", name));
+}
+
+private void appendNodeToPath(
+    ref JSONValue payload,
+    string parentPath,
+    JSONValue child
+) {
+    mutateUniqueNode(payload, parentPath, (ref JSONValue parent) {
+        if (!("children" in parent.object)) {
+            parent.object["children"] = JSONValue(JSONValue[].init);
+        }
+        if (parent["children"].type != JSONType.array) {
+            throw new Exception(format(
+                "Node '%s' children must be an array.",
+                parentPath
+            ));
+        }
+        parent["children"].array ~= child;
+    });
+}
+
+private void applyRigPhysics(
+    ref JSONValue payload,
+    JSONValue physics,
+    JSONValue parameters,
+    ref AgentRigSummary summary,
+    ref ulong nextUuid
+) {
+    if (physics.type != JSONType.array) {
+        throw new Exception("Rig specification physics must be an array.");
+    }
+
+    foreach (physicsIndex, physicsRequest; physics.array) {
+        string label = format("Physics request %s", physicsIndex);
+        string name = requiredString(physicsRequest, "name", label);
+        string parentPath = requiredString(physicsRequest, "parent", label);
+        string parameterName = requiredString(physicsRequest, "parameter", label);
+        string modelType = requiredString(physicsRequest, "model_type", label);
+        string mapMode = requiredString(physicsRequest, "map_mode", label);
+        if (modelType == "pendulum") modelType = "Pendulum";
+        if (modelType == "spring_pendulum") modelType = "SpringPendulum";
+        if (mapMode == "angle_length") mapMode = "AngleLength";
+        if (mapMode == "xy") mapMode = "XY";
+        if (mapMode == "length_angle") mapMode = "LengthAngle";
+        if (mapMode == "yx") mapMode = "YX";
+        if (
+            modelType != "Pendulum" &&
+            modelType != "SpringPendulum"
+        ) {
+            throw new Exception(format(
+                "%s model_type must be pendulum or spring_pendulum.",
+                label
+            ));
+        }
+        if (
+            mapMode != "AngleLength" &&
+            mapMode != "XY" &&
+            mapMode != "LengthAngle" &&
+            mapMode != "YX"
+        ) {
+            throw new Exception(format(
+                "%s map_mode is unsupported.",
+                label
+            ));
+        }
+
+        auto parameterUuid = findParameterUuid(parameters, parameterName);
+        double outputScaleX;
+        double outputScaleY;
+        auto outputScale = objectField(
+            physicsRequest,
+            "output_scale",
+            JSONValue([JSONValue(1.0), JSONValue(1.0)])
+        );
+        if (
+            outputScale.type != JSONType.array ||
+            outputScale.array.length != 2
+        ) {
+            throw new Exception(format(
+                "%s output_scale must contain [x,y].",
+                label
+            ));
+        }
+        outputScaleX = readFiniteNumber(
+            outputScale.array[0],
+            label ~ " output_scale x"
+        );
+        outputScaleY = readFiniteNumber(
+            outputScale.array[1],
+            label ~ " output_scale y"
+        );
+
+        auto driver = buildSimplePhysicsNode(
+            nextUuid++,
+            name,
+            parameterUuid,
+            modelType,
+            mapMode,
+            readFiniteNumber(
+                objectField(physicsRequest, "gravity", JSONValue(1.0)),
+                label ~ " gravity"
+            ),
+            readFiniteNumber(
+                objectField(physicsRequest, "length", JSONValue(100.0)),
+                label ~ " length"
+            ),
+            readFiniteNumber(
+                objectField(physicsRequest, "frequency", JSONValue(1.0)),
+                label ~ " frequency"
+            ),
+            readFiniteNumber(
+                objectField(physicsRequest, "angle_damping", JSONValue(0.5)),
+                label ~ " angle_damping"
+            ),
+            readFiniteNumber(
+                objectField(physicsRequest, "length_damping", JSONValue(0.5)),
+                label ~ " length_damping"
+            ),
+            outputScaleX,
+            outputScaleY,
+            objectField(
+                physicsRequest,
+                "local_only",
+                JSONValue(false)
+            ).type == JSONType.true_
+        );
+        appendNodeToPath(payload, parentPath, driver);
+        summary.physicsCount++;
+    }
+}
+
+private void applyRigGroups(
+    ref JSONValue payload,
+    JSONValue groups,
+    ref AgentRigSummary summary,
+    ref ulong nextUuid
+) {
+    if (groups.type != JSONType.array) {
+        throw new Exception("Rig specification groups must be an array.");
+    }
+
+    foreach (groupIndex, groupRequest; groups.array) {
+        string label = format("Group request %s", groupIndex);
+        string name = requiredString(groupRequest, "name", label);
+        auto paths = objectField(groupRequest, "paths", JSONValue(JSONValue[].init));
+        if (paths.type != JSONType.array || paths.array.length == 0) {
+            throw new Exception(format("%s requires a non-empty paths array.", label));
+        }
+        double zsort = readFiniteNumber(
+            objectField(groupRequest, "zsort", JSONValue(0.0)),
+            label ~ " zsort"
+        );
+        double pivotX;
+        double pivotY;
+        auto pivotValue = objectField(
+            groupRequest,
+            "pivot",
+            JSONValue([JSONValue(0.0), JSONValue(0.0)])
+        );
+        if (
+            pivotValue.type != JSONType.array ||
+            pivotValue.array.length != 2
+        ) {
+            throw new Exception(format("%s pivot must contain [x,y].", label));
+        }
+        pivotX = readFiniteNumber(pivotValue.array[0], label ~ " pivot x");
+        pivotY = readFiniteNumber(pivotValue.array[1], label ~ " pivot y");
+
+        JSONValue[] children;
+        foreach (pathIndex, pathValue; paths.array) {
+            if (pathValue.type != JSONType.string || pathValue.str.length == 0) {
+                throw new Exception(format(
+                    "%s paths[%s] must be a non-empty string.",
+                    label,
+                    pathIndex
+                ));
+            }
+            string path = pathValue.str;
+            JSONValue extracted;
+            auto matches = extractNodeByPath(
+                payload["nodes"],
+                "",
+                path,
+                extracted,
+                -pivotX,
+                -pivotY
+            );
+            if (matches == 0) {
+                throw new Exception(format("Could not find group path '%s'.", path));
+            }
+            if (matches > 1) {
+                throw new Exception(format("Group path '%s' is ambiguous.", path));
+            }
+            children ~= extracted;
+        }
+
+        auto groupNode = buildAgentGroup(
+            nextUuid++,
+            name,
+            children,
+            zsort,
+            pivotX,
+            pivotY
+        );
+        payload["nodes"].object["children"].array ~= groupNode;
+        summary.groupCount++;
+    }
+}
+
 private JSONValue buildGridMesh(JSONValue existingMesh, size_t columns, size_t rows) {
     if (columns < 2 || rows < 2) {
         throw new Exception("Grid mesh columns and rows must both be at least two.");
@@ -1062,6 +1479,27 @@ AgentRigSummary agentApplyRigSpec(
     }
     auto document = parseInx(cast(const(ubyte)[]) read(inputPath));
     AgentRigSummary summary;
+    auto existingParameters = objectField(
+        document.payload,
+        "param",
+        JSONValue(JSONValue[].init)
+    );
+    if (existingParameters.type != JSONType.array) {
+        throw new Exception("INX parameters must be an array.");
+    }
+    ulong nextUuid = maximumUuid(document.payload["nodes"], existingParameters) + 1;
+
+    auto groups = objectField(
+        specification,
+        "groups",
+        JSONValue(JSONValue[].init)
+    );
+    applyRigGroups(
+        document.payload,
+        groups,
+        summary,
+        nextUuid
+    );
 
     auto meshes = objectField(specification, "meshes", JSONValue(JSONValue[].init));
     if (meshes.type != JSONType.array) {
@@ -1091,14 +1529,6 @@ AgentRigSummary agentApplyRigSpec(
         summary.meshedPartCount++;
     }
 
-    auto existingParameters = objectField(
-        document.payload,
-        "param",
-        JSONValue(JSONValue[].init)
-    );
-    if (existingParameters.type != JSONType.array) {
-        throw new Exception("INX parameters must be an array.");
-    }
     auto parameters = objectField(
         specification,
         "parameters",
@@ -1108,7 +1538,6 @@ AgentRigSummary agentApplyRigSpec(
         throw new Exception("Rig specification parameters must be an array.");
     }
 
-    ulong nextUuid = maximumUuid(document.payload["nodes"], existingParameters) + 1;
     foreach (parameterIndex, parameterRequest; parameters.array) {
         string parameterLabel = format("Parameter request %s", parameterIndex);
         string name = requiredString(parameterRequest, "name", parameterLabel);
@@ -1254,6 +1683,18 @@ AgentRigSummary agentApplyRigSpec(
     }
 
     document.payload.object["param"] = existingParameters;
+    auto physics = objectField(
+        specification,
+        "physics",
+        JSONValue(JSONValue[].init)
+    );
+    applyRigPhysics(
+        document.payload,
+        physics,
+        existingParameters,
+        summary,
+        nextUuid
+    );
     write(outputPath, serializeInx(document));
     return summary;
 }
