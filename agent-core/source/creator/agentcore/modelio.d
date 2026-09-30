@@ -63,11 +63,12 @@ struct AgentRigSummary {
     size_t compositeCount;
     size_t partPropertyCount;
     size_t automationCount;
+    size_t animationCount;
 
     string toJson() const {
         return format(
             `{"groupCount":%s,"meshedPartCount":%s,"maskCount":%s,"parameterCount":%s,"bindingCount":%s,"physicsCount":%s,` ~
-            `"meshGroupCount":%s,"compositeCount":%s,"partPropertyCount":%s,"automationCount":%s}`,
+            `"meshGroupCount":%s,"compositeCount":%s,"partPropertyCount":%s,"automationCount":%s,"animationCount":%s}`,
             groupCount,
             meshedPartCount,
             maskCount,
@@ -77,7 +78,8 @@ struct AgentRigSummary {
             meshGroupCount,
             compositeCount,
             partPropertyCount,
-            automationCount
+            automationCount,
+            animationCount
         );
     }
 }
@@ -1586,6 +1588,134 @@ private void applyRigAutomation(ref JSONValue payload, JSONValue automation, ref
     payload.object["automation"] = existing;
 }
 
+private void collectPhysicsParameters(JSONValue node, ref bool[ulong] driven) {
+    if (node.type != JSONType.object) return;
+    if (objectField(node, "type", JSONValue("")).str == "SimplePhysics" && "param" in node.object)
+        driven[node["param"].get!ulong] = true;
+    foreach (child; objectField(node, "children", JSONValue.emptyArray).array)
+        collectPhysicsParameters(child, driven);
+}
+
+// Keyframed parameter animations (the Inochi2D counterpart of motion files).
+// Each lane animates one parameter axis; the SDK AnimationPlayer interpolates
+// between keyframes at runtime. Same-named animations are replaced.
+private void applyRigAnimations(ref JSONValue payload, JSONValue animations, ref AgentRigSummary summary) {
+    import std.algorithm : canFind;
+    import std.math : abs;
+    if (animations.type != JSONType.array) throw new Exception("Rig specification animations must be an array.");
+    auto parameters = objectField(payload, "param", JSONValue.emptyArray);
+    auto existing = objectField(payload, "animations", JSONValue.emptyObject);
+    if (existing.type != JSONType.object) throw new Exception("INX animations must be an object.");
+    bool[ulong] driven;
+    collectPhysicsParameters(payload["nodes"], driven);
+    bool[string] names;
+    foreach (index, request; animations.array) {
+        string label = format("Animation request %s", index);
+        requireFields(request, ["name", "fps", "length", "additive", "weight", "lead_in", "lead_out", "lanes"], label);
+        string name = requiredString(request, "name", label);
+        if (name in names) throw new Exception("Duplicate animation '" ~ name ~ "'.");
+        names[name] = true;
+        double fps = readFiniteNumber(objectField(request, "fps", JSONValue(30.0)), label ~ " fps");
+        if (!(fps > 0) || fps > 240) throw new Exception(label ~ " fps must be in (0, 240].");
+        auto length = readIndex(objectField(request, "length", JSONValue.init), label ~ " length");
+        if (length < 1) throw new Exception(label ~ " length must be at least one frame.");
+        auto additiveValue = objectField(request, "additive", JSONValue(false));
+        if (additiveValue.type != JSONType.true_ && additiveValue.type != JSONType.false_)
+            throw new Exception(label ~ " additive must be boolean.");
+        bool additive = additiveValue.type == JSONType.true_;
+        double weight = readFiniteNumber(objectField(request, "weight", JSONValue(1.0)), label ~ " weight");
+        if (weight < 0 || weight > 1) throw new Exception(label ~ " weight must be in [0,1].");
+        long[2] lead;
+        foreach (i, key; ["lead_in", "lead_out"]) {
+            if (key in request.object) {
+                lead[i] = cast(long) readIndex(request[key], label ~ " " ~ key);
+                if (lead[i] > length) throw new Exception(label ~ " " ~ key ~ " exceeds the length.");
+            } else lead[i] = -1;
+        }
+        if (lead[0] >= 0 && lead[1] >= 0 && lead[0] > lead[1])
+            throw new Exception(label ~ " lead_in must not come after lead_out.");
+
+        auto lanes = objectField(request, "lanes", JSONValue.init);
+        if (lanes.type != JSONType.array || lanes.array.length == 0) throw new Exception(label ~ " requires lanes.");
+        JSONValue[] written;
+        bool[string] targets;
+        foreach (laneIndex, lane; lanes.array) {
+            string laneLabel = format("%s lane[%s]", label, laneIndex);
+            requireFields(lane, ["parameter", "axis", "interpolation", "merge_mode", "keyframes"], laneLabel);
+            string parameterName = requiredString(lane, "parameter", laneLabel);
+            auto axis = readIndex(objectField(lane, "axis", JSONValue(0)), laneLabel ~ " axis");
+            JSONValue parameter;
+            bool found;
+            foreach (candidate; parameters.array)
+                if (candidate["name"].str == parameterName) { parameter = candidate; found = true; }
+            if (!found) throw new Exception(laneLabel ~ " references unknown parameter '" ~ parameterName ~ "'.");
+            ulong uuid = parameter["uuid"].get!ulong;
+            if (uuid in driven)
+                throw new Exception(laneLabel ~ " targets '" ~ parameterName ~ "', which physics drives; animate its cause instead.");
+            bool isVec2 = objectField(parameter, "is_vec2", JSONValue(false)).type == JSONType.true_;
+            if (axis > (isVec2 ? 1 : 0)) throw new Exception(laneLabel ~ " axis is out of range for " ~ parameterName ~ ".");
+            string identity = format("%s#%s", parameterName, axis);
+            if (identity in targets) throw new Exception(laneLabel ~ " duplicates a parameter axis.");
+            targets[identity] = true;
+            string interpolation = "interpolation" in lane.object ? requiredString(lane, "interpolation", laneLabel) : "Cubic";
+            if (!["Nearest", "Linear", "Stepped", "Cubic", "Bezier"].canFind(interpolation))
+                throw new Exception(laneLabel ~ " interpolation must be Nearest, Linear, Stepped, Cubic or Bezier.");
+            string mergeMode = "merge_mode" in lane.object ? requiredString(lane, "merge_mode", laneLabel) : (additive ? "Additive" : "Forced");
+            if (!["Forced", "Additive", "Multiplicative", "Weighted"].canFind(mergeMode))
+                throw new Exception(laneLabel ~ " merge_mode must be Forced, Additive, Multiplicative or Weighted.");
+            double lo = readFiniteNumber(parameter["min"].array[axis], "Parameter min");
+            double hi = readFiniteNumber(parameter["max"].array[axis], "Parameter max");
+            auto keyframes = objectField(lane, "keyframes", JSONValue.init);
+            if (keyframes.type != JSONType.array || keyframes.array.length == 0)
+                throw new Exception(laneLabel ~ " requires keyframes.");
+            JSONValue[] frames;
+            long previous = -1;
+            foreach (keyIndex, key; keyframes.array) {
+                string keyLabel = format("%s keyframe[%s]", laneLabel, keyIndex);
+                if (key.type != JSONType.array || (key.array.length != 2 && key.array.length != 3))
+                    throw new Exception(keyLabel ~ " must be [frame, value] or [frame, value, tension].");
+                auto frame = cast(long) readIndex(key.array[0], keyLabel ~ " frame");
+                if (frame <= previous) throw new Exception(keyLabel ~ " frames must increase strictly.");
+                // The SDK player holds frame length-1 as the last frame.
+                if (frame >= length) throw new Exception(keyLabel ~ " frame must be below the animation length.");
+                previous = frame;
+                double value = readFiniteNumber(key.array[1], keyLabel ~ " value");
+                // Forced lanes set the value; offset lanes may move it by at most the full span.
+                double span = hi - lo;
+                bool inRange = mergeMode == "Forced" ? (value >= lo && value <= hi)
+                    : mergeMode == "Additive" ? abs(value) <= span : value >= 0;
+                if (!inRange) throw new Exception(keyLabel ~ " value is out of range for " ~ identity ~ ".");
+                double tension = key.array.length == 3 ? readFiniteNumber(key.array[2], keyLabel ~ " tension") : 0.5;
+                if (tension < 0 || tension > 1) throw new Exception(keyLabel ~ " tension must be in [0,1].");
+                JSONValue[string] entry;
+                entry["frame"] = JSONValue(frame);
+                entry["value"] = JSONValue(value);
+                entry["tension"] = JSONValue(tension);
+                frames ~= JSONValue(entry);
+            }
+            JSONValue[string] laneNode;
+            // The SDK reads enums by name.
+            laneNode["interpolation"] = JSONValue(interpolation);
+            laneNode["uuid"] = JSONValue(uuid);
+            laneNode["target"] = JSONValue(axis);
+            laneNode["keyframes"] = JSONValue(frames);
+            laneNode["merge_mode"] = JSONValue(mergeMode);
+            written ~= JSONValue(laneNode);
+        }
+        JSONValue[string] node;
+        node["timestep"] = JSONValue(1.0 / fps);
+        node["additive"] = JSONValue(additive);
+        node["animationWeight"] = JSONValue(weight);
+        node["length"] = JSONValue(length);
+        node["leadIn"] = JSONValue(lead[0]);
+        node["leadOut"] = JSONValue(lead[1]);
+        node["lanes"] = JSONValue(written);
+        existing.object[name] = JSONValue(node);
+        summary.animationCount++;
+    }
+    payload.object["animations"] = existing;
+}
+
 private JSONValue buildGridMesh(JSONValue existingMesh, size_t columns, size_t rows) {
     if (columns < 2 || rows < 2) {
         throw new Exception("Grid mesh columns and rows must both be at least two.");
@@ -2106,7 +2236,7 @@ AgentRigSummary agentApplyRigSpec(
     string outputPath,
     JSONValue specification
 ) {
-    requireFields(specification, ["schema_version", "groups", "parts", "masks", "meshes", "parameters", "physics", "automation"], "Rig specification");
+    requireFields(specification, ["schema_version", "groups", "parts", "masks", "meshes", "parameters", "physics", "automation", "animations"], "Rig specification");
     if ("schema_version" in specification.object && readIndex(specification["schema_version"], "schema_version") != 1)
         throw new Exception("Unsupported rig schema_version; expected 1.");
     auto document = parseInx(cast(const(ubyte)[]) read(inputPath));
@@ -2370,6 +2500,7 @@ AgentRigSummary agentApplyRigSpec(
         nextUuid
     );
     applyRigAutomation(document.payload, objectField(specification, "automation", JSONValue(JSONValue[].init)), summary);
+    applyRigAnimations(document.payload, objectField(specification, "animations", JSONValue(JSONValue[].init)), summary);
     write(outputPath, serializeInx(document));
     return summary;
 }

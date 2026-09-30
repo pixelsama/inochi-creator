@@ -31,10 +31,12 @@ JSONValue agentCapabilities() {
         "AddGlow","ColorBurn","HardLight","SoftLight","Difference","Exclusion","Subtract","Inverse",
         "DestinationIn","ClipToLower","SliceFromLower"],
       "automation":["sine"],
+      "animations":{"interpolation":["Nearest","Linear","Stepped","Cubic","Bezier"],
+        "merge_modes":["Forced","Additive","Multiplicative","Weighted"]},
       "physics":["Pendulum","SpringPendulum"],"model_format":"Inochi2D INX",
       "cpu_renderer":{"blend_semantics":"legacy OpenGL (macOS runtime)",
         "legacy_normal_fallbacks":["Overlay","Darken","ColorBurn","HardLight","SoftLight","Difference"],
-        "composites":true,"composite_masks":false,"tint":true,"masks":true,"physics":true,"automation":true,
+        "composites":true,"composite_masks":false,"tint":true,"masks":true,"physics":true,"automation":true,"animations":true,
         "supersample":{"default":1,"min":1,"max":4,"max_raster_pixels":16777216}},
       "limits":{"cubism_moc3_export":false,"bound_topology_migration":"UV barycentric; covered UVs only",
         "nested_composites":false},
@@ -62,6 +64,31 @@ JSONValue agentDescribeModel(string path) {
     result.object["parameters"] = payload.object.get("param", JSONValue.emptyArray);
     result.object["physics"] = payload.object.get("physics", JSONValue.emptyObject);
     result.object["automation"] = payload.object.get("automation", JSONValue.emptyArray);
+    string[ulong] parameterNames;
+    foreach (parameter; payload.object.get("param", JSONValue.emptyArray).array)
+        parameterNames[parameter["uuid"].get!ulong] = parameter["name"].str;
+    JSONValue[] animations;
+    foreach (name, animation; payload.object.get("animations", JSONValue.emptyObject).object) {
+        JSONValue[] lanes;
+        foreach (lane; animation.object.get("lanes", JSONValue.emptyArray).array) {
+            auto uuid = lane["uuid"].get!ulong;
+            JSONValue[string] entry;
+            entry["parameter"] = JSONValue(uuid in parameterNames ? parameterNames[uuid] : "");
+            entry["axis"] = lane["target"];
+            entry["interpolation"] = lane["interpolation"];
+            entry["merge_mode"] = lane.object.get("merge_mode", JSONValue("Forced"));
+            entry["keyframeCount"] = JSONValue(cast(ulong) lane["keyframes"].array.length);
+            lanes ~= JSONValue(entry);
+        }
+        JSONValue[string] entry;
+        entry["name"] = JSONValue(name);
+        entry["length"] = animation["length"];
+        entry["fps"] = JSONValue(1.0 / animation["timestep"].get!double);
+        entry["additive"] = animation["additive"];
+        entry["lanes"] = JSONValue(lanes);
+        animations ~= JSONValue(entry);
+    }
+    result.object["animations"] = JSONValue(animations);
     return result;
 }
 

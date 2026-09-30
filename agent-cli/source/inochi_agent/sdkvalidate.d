@@ -22,6 +22,8 @@ struct AgentSdkValidationSummary {
     size_t textureReferenceCount;
     size_t driverCount;
     size_t drivenParameterCount;
+    size_t animationCount;
+    size_t animationLaneCount;
 
     string toJson() const {
         JSONValue[string] object;
@@ -31,6 +33,8 @@ struct AgentSdkValidationSummary {
         object["textureReferenceCount"] = JSONValue(cast(ulong) textureReferenceCount);
         object["driverCount"] = JSONValue(cast(ulong) driverCount);
         object["drivenParameterCount"] = JSONValue(cast(ulong) drivenParameterCount);
+        object["animationCount"] = JSONValue(cast(ulong) animationCount);
+        object["animationLaneCount"] = JSONValue(cast(ulong) animationLaneCount);
         return JSONValue(object).toString();
     }
 }
@@ -153,6 +157,15 @@ AgentSdkValidationSummary agentValidateWithSdk(string path) {
     }
     summary.driverCount = puppet.getDrivers().length;
     summary.drivenParameterCount = puppet.getParameterDrivers().length;
+    foreach (name, ref animation; puppet.getAnimations()) {
+        foreach (lane; animation.lanes) {
+            // finalize() resolves each lane's parameter UUID; a miss would crash playback.
+            if (lane.paramRef is null || lane.paramRef.targetParam is null)
+                throw new Exception("Animation '" ~ name ~ "' has a lane without a resolvable parameter.");
+            summary.animationLaneCount++;
+        }
+        summary.animationCount++;
+    }
     return summary;
 }
 

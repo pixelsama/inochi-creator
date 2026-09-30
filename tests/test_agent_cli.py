@@ -106,6 +106,43 @@ class AgentCLIContracts(unittest.TestCase):
             {"name": "bad", "parameters": {}, "physics": {"frames": 4, "capture_every": 0}}]}))
         self.call("pose-render", self.model, poses, self.directory / "bad", ok=False, code="VALIDATION_ERROR")
 
+    def test_keyframed_animation_is_stored_and_played(self):
+        self.import_model()
+        self.call("rig-apply", self.model, self.model, self.rig)
+        motion = {"schema_version": 1, "animations": [{
+            "name": "Sway", "fps": 10, "length": 5, "lanes": [
+                {"parameter": "HeadXY", "axis": 0, "interpolation": "Linear",
+                 "keyframes": [[0, -1], [2, 1], [4, 0.5]]}]}]}
+        self.rig.write_text(json.dumps(motion))
+        applied = self.call("rig-apply", self.model, self.model, self.rig)
+        self.assertEqual(applied["rig"]["animationCount"], 1)
+        self.assertEqual((applied["sdk"]["animationCount"], applied["sdk"]["animationLaneCount"]), (1, 1))
+        described = self.call("model-describe", self.model)["animations"]
+        self.assertEqual(described[0]["name"], "Sway")
+        self.assertEqual(described[0]["lanes"][0]["parameter"], "HeadXY")
+        self.assertEqual(described[0]["lanes"][0]["keyframeCount"], 3)
+        poses = self.directory / "play.json"
+        poses.write_text(json.dumps({"canvas": {"width": 32, "height": 32}, "poses": [
+            {"name": "played", "parameters": {},
+             "physics": {"frames": 4, "dt": 0.1, "animation": {"name": "Sway"}}},
+            {"name": "static", "parameters": {"HeadXY": [0.5, 0]}}]}))
+        played, static = self.call("pose-render", self.model, poses, self.directory / "play")["poses"]
+        # After four 0.1s steps at 10 fps the player holds the last keyframe.
+        self.assertEqual(played["rgbaSha256"], static["rgbaSha256"])
+        poses.write_text(json.dumps({"canvas": {"width": 32, "height": 32}, "poses": [
+            {"name": "missing", "parameters": {}, "physics": {"frames": 2, "animation": {"name": "Nope"}}}]}))
+        self.call("pose-render", self.model, poses, self.directory / "bad", ok=False, code="VALIDATION_ERROR")
+
+        def rejected(lane):
+            bad = {"schema_version": 1, "animations": [{"name": "Bad", "length": 4, "lanes": [lane]}]}
+            self.rig.write_text(json.dumps(bad))
+            self.call("rig-validate", self.model, self.rig, ok=False, code="VALIDATION_ERROR")
+        rejected({"parameter": "Missing", "keyframes": [[0, 0]]})
+        rejected({"parameter": "HeadXY", "keyframes": [[2, 0], [1, 0]]})
+        rejected({"parameter": "HeadXY", "keyframes": [[0, 3]]})
+        rejected({"parameter": "HeadXY", "axis": 1, "keyframes": [[0, -0.5]]})
+        rejected({"parameter": "HeadXY", "keyframes": [[4, 0]]})
+
     def test_discoverable_rig_schema(self):
         schema = self.call("schema", "rig")
         self.assertEqual(schema["type"], "object")

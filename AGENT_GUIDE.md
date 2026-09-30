@@ -183,6 +183,25 @@ PSD 导入时，混合模式不是穿透/正常、或不透明度低于 100% 的
 
 `speed` 为弧度/秒，`wave` 为 `sin` 或 `cos`，`range` 必须在参数范围内。波形以参数的 Additive 合并方式叠加到面捕值上；同名自动化会被替换。0.8.7 SDK 读取 automation 的 `range` 时有错误，本分支通过 `inochi2d-serialization-fixes.patch` 修复，Agent Session 使用同一份 SDK。
 
+### 关键帧动画
+
+`animations` 把动作写进模型，是 Inochi2D 中与 Live2D motion 文件对应的数据，由 SDK 的 AnimationPlayer 播放。Inochi Session 可以在加载、空闲或面捕阈值触发时播放它们。
+
+```json
+{"animations":[{"name":"Nod","fps":30,"length":60,"lanes":[
+  {"parameter":"HeadXY","axis":1,"interpolation":"Cubic","keyframes":[[0,0],[12,-0.8],[24,0.1],[59,0]]}]}]}
+```
+
+- 每条 lane 驱动一个参数轴。关键帧写成 `[frame, value]` 或 `[frame, value, tension]`，帧号严格递增。
+- 帧号必须在 `[0, length-1]` 内：播放器最后停在第 length-1 帧。
+- `interpolation` 可选 Nearest、Linear、Stepped、Cubic（默认）、Bezier。Cubic 是 Catmull-Rom 曲线，可能越过关键值。
+- `merge_mode` 默认为 Forced，即覆盖面捕值，关键值必须在参数范围内。`additive:true` 的动画默认用 Additive，值是叠加在面捕值上的偏移。
+- `lead_in` / `lead_out` 定义循环区间以外的开头和结尾。
+- 不允许以物理驱动的参数为目标：物理每帧都会覆盖它们。请改为给引起摆动的参数做动画。
+- 同名动画会被替换。`model-describe` 的 `animations` 列出各条动画的轨道；`rig-apply` 返回的 SDK 统计中含 `animationCount` / `animationLaneCount`，表示 SDK 已加载并解析了每条 lane 的参数。
+
+预览时，在 pose 的 physics 中加 `"animation":{"name":"Nod","loop":false}`，就会按运行时的顺序每帧先更新 AnimationPlayer、再更新 puppet，因此物理也会随动画响应。配合 `capture_every` 可以一次输出整段动作的逐帧图像。
+
 ## 姿态验证与渲染
 
 ```json

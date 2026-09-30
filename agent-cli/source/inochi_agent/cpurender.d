@@ -14,6 +14,7 @@ import imagefmt : IF_ERROR, read_image, write_image;
 import inochi2d : Composite, Node, Part, Puppet, inClearUUIDs, inInit, inLoadINPPuppet,
     inSetTimingFunc, inUpdate;
 import inochi2d.core.nodes.common : BlendMode, MaskingMode;
+import inochi2d.core.animation.player : AnimationPlayer;
 import inochi2d.math : mat4, vec2, vec4;
 
 import creator.agentcore.modelio : AgentTextureBlob, agentReadModelTextures, agentReadModelPayload;
@@ -784,6 +785,23 @@ private size_t simulatePhysics(
     }
     if (frames == 0) return 0;
 
+    // An embedded animation plays through the SDK AnimationPlayer, in the
+    // same order as the runtime: player update, then puppet update.
+    AnimationPlayer player;
+    if ("animation" in physics.object) {
+        auto request = physics["animation"];
+        if (request.type != JSONType.object || !("name" in request.object) || request["name"].type != JSONType.string)
+            throw new Exception(label ~ " animation must be an object with a name.");
+        foreach (key, ignored; request.object)
+            if (key != "name" && key != "loop") throw new Exception(label ~ " animation has unknown field '" ~ key ~ "'.");
+        bool loop = "loop" in request.object && request["loop"].type == JSONType.true_;
+        player = new AnimationPlayer(puppet);
+        auto playback = player.createOrGet(request["name"].str);
+        if (playback is null)
+            throw new Exception(label ~ " animation '" ~ request["name"].str ~ "' is not in the model.");
+        playback.play(loop);
+    }
+
     puppet.resetDrivers();
     auto trajectory = physics.object.get("trajectory", JSONValue.init);
     if (
@@ -808,6 +826,7 @@ private size_t simulatePhysics(
         }
         renderClock += dt;
         inUpdate();
+        if (player !is null) player.update(dt);
         puppet.update();
         if (onFrame !is null) onFrame(frame);
     }
