@@ -1,120 +1,52 @@
 module inochi_agent.commands;
 
-import std.conv : to;
-import std.file : exists, read, remove, rename, write;
-import std.json : parseJSON;
-import std.stdio : writeln;
+import std.json : JSONValue, JSONException;
+import std.file : FileException;
+import std.stdio : writeln, stderr;
+import inochi_agent.automation;
 
-import creator.agentcore.modelio;
-import creator.agentcore.psdimport;
-import creator.agentcore.psdinspect;
-import inochi_agent.cpurender;
-import inochi_agent.sdkvalidate;
-
-private void printUsage() {
-    writeln("Usage:");
-    writeln("  inochi-agent inspect <model.inx>");
-    writeln("  inochi-agent roundtrip <input.inx> <output.inx>");
-    writeln("  inochi-agent mesh-replace <input.inx> <output.inx> <part-uuid> <mesh.json>");
-    writeln("  inochi-agent mesh-replace-path <input.inx> <output.inx> <psd-layer-path> <mesh.json>");
-    writeln("  inochi-agent rig-apply <input.inx> <output.inx> <rig.json>");
-    writeln("  inochi-agent pose-sample <model.inx> <poses.json>");
-    writeln("  inochi-agent pose-render <model.inx> <poses.json> <output-dir>");
-    writeln("  inochi-agent psd-inspect <input.psd> <report.json>");
-    writeln("  inochi-agent psd-import <input.psd> <output.inx>");
-    writeln("  inochi-agent sdk-validate <model.inx>");
-}
-
-/**
- * Runs a headless Agent command.  The command surface is deliberately
- * separate from `main` so that it can later be called by an IPC server,
- * scheduler, or GUI adapter without synthesizing keyboard input.
+/** Machine calls have one envelope, stable error codes and a nonzero status.
+ * Legacy invocations retain their result-only output and scalar contracts.
  */
 int runAgentCommand(string[] args) {
-    if (args.length == 3 && args[1] == "inspect") {
-        auto summary = agentInspectModel(args[2]);
-        writeln(summary.toJson());
-        return 0;
+    bool machine = args.length > 1 && args[1] == "--json";
+    auto command = args[(machine ? 2 : 1) .. $];
+    if (!machine && (command.length == 0 || command[0] == "--help" || command[0] == "help")) {
+        writeln("Usage: inochi-agent [--json] <command> <args...>");
+        writeln("Use 'capabilities' for supported commands and AGENT_GUIDE.md for schemas and examples.");
+        return command.length == 0 ? 2 : 0;
     }
-
-    if (args.length == 4 && args[1] == "roundtrip") {
-        auto summary = agentRoundTripModel(args[2], args[3]);
-        writeln(summary.toJson());
+    JSONValue envelope = JSONValue.emptyObject;
+    envelope.object["protocol_version"] = JSONValue(1);
+    try {
+        auto result = agentExecute(command, machine);
+        if (machine) {
+            envelope.object["result"] = result;
+            envelope.object["ok"] = JSONValue(true);
+            writeln(envelope.toString());
+        } else if (command[0] == "rig-apply") {
+            writeln(result["rig"].toString());
+            writeln(result["sdk"].toString());
+        } else if (command[0] == "psd-import") {
+            writeln(result["import"].toString());
+            writeln(result["sdk"].toString());
+        } else if (command[0] == "mesh-replace" || command[0] == "mesh-replace-path" || command[0] == "mesh-retopologize-path") {
+            writeln(result["mesh"].toString());
+        } else if (command[0] == "roundtrip") {
+            writeln(result["model"].toString());
+        } else writeln(result.toString());
         return 0;
+    } catch (Exception e) {
+        string code = "VALIDATION_ERROR";
+        int status = 1;
+        if (cast(AgentUsageError)e) { code = "USAGE_ERROR"; status = 2; }
+        else if (cast(JSONException)e) code = "INVALID_JSON";
+        else if (cast(FileException)e) code = "IO_ERROR";
+        if (machine) {
+            envelope.object["ok"] = JSONValue(false);
+            envelope.object["error"] = JSONValue(["code":JSONValue(code), "message":JSONValue(e.msg)]);
+            writeln(envelope.toString());
+        } else stderr.writeln(code ~ ": " ~ e.msg);
+        return status;
     }
-
-    if (args.length == 6 && args[1] == "mesh-replace") {
-        auto partUuid = args[4].to!ulong;
-        auto mesh = parseJSON(cast(string) read(args[5]));
-        auto summary = agentReplacePartMesh(args[2], args[3], partUuid, mesh);
-        writeln(summary.toJson());
-        return 0;
-    }
-
-    if (args.length == 6 && args[1] == "mesh-replace-path") {
-        auto mesh = parseJSON(cast(string) read(args[5]));
-        auto summary = agentReplacePartMeshByPsdPath(
-            args[2],
-            args[3],
-            args[4],
-            mesh
-        );
-        writeln(summary.toJson());
-        return 0;
-    }
-
-    if (args.length == 5 && args[1] == "rig-apply") {
-        string temporaryPath = args[3] ~ ".agent-incomplete";
-        if (exists(temporaryPath)) remove(temporaryPath);
-        scope (failure) if (exists(temporaryPath)) remove(temporaryPath);
-
-        auto specification = parseJSON(cast(string) read(args[4]));
-        auto rigSummary = agentApplyRigSpec(args[2], temporaryPath, specification);
-        auto sdkSummary = agentValidateWithSdk(temporaryPath);
-        rename(temporaryPath, args[3]);
-        writeln(rigSummary.toJson());
-        writeln(sdkSummary.toJson());
-        return 0;
-    }
-
-    if (args.length == 4 && args[1] == "pose-sample") {
-        auto specification = parseJSON(cast(string) read(args[3]));
-        writeln(agentSamplePoses(args[2], specification).toJson());
-        return 0;
-    }
-
-    if (args.length == 5 && args[1] == "pose-render") {
-        auto specification = parseJSON(cast(string) read(args[3]));
-        writeln(agentRenderPoses(args[2], specification, args[4]).toJson());
-        return 0;
-    }
-
-    if (args.length == 4 && args[1] == "psd-inspect") {
-        auto inspection = agentInspectPsd(args[2]);
-        write(args[3], inspection.toReportJson());
-        writeln(inspection.toSummaryJson());
-        return 0;
-    }
-
-    if (args.length == 4 && args[1] == "psd-import") {
-        string temporaryPath = args[3] ~ ".agent-incomplete";
-        if (exists(temporaryPath)) remove(temporaryPath);
-        scope (failure) if (exists(temporaryPath)) remove(temporaryPath);
-
-        auto importSummary = agentImportPsdToInx(args[2], temporaryPath);
-        auto sdkSummary = agentValidateWithSdk(temporaryPath);
-        rename(temporaryPath, args[3]);
-        importSummary.outputPath = args[3];
-        writeln(importSummary.toJson());
-        writeln(sdkSummary.toJson());
-        return 0;
-    }
-
-    if (args.length == 3 && args[1] == "sdk-validate") {
-        writeln(agentValidateWithSdk(args[2]).toJson());
-        return 0;
-    }
-
-    printUsage();
-    return 2;
 }

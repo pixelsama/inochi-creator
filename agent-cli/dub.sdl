@@ -8,6 +8,7 @@ dependency "inochi2d" version="~>0.8.7"
 subConfiguration "inochi2d" "renderless"
 
 sourcePaths "source"
+stringImportPaths "contracts"
 mainSourceFile "source/inochi_agent/app.d"
 
 configuration "application" {

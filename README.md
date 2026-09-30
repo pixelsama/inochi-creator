@@ -68,17 +68,26 @@ This fork adds a deliberately renderer-free `agent-core` package and an
 `agent-cli` executable. They validate and inspect an `.inx` container without
 SDL, OpenGL, ImGui, a window, or `computer use`.
 
-The initial stable command surface is:
+The Agent interface now includes one-/two-axis parameter rigs, custom meshes,
+per-vertex deformation keys, UV-based deformation migration, masks, physics,
+SDK pose probes and CPU previews. See [the Agent guide](AGENT_GUIDE.md) for the
+JSON contracts, examples and limitations, and [the verification matrix](AGENT_REQUIREMENTS.md)
+for tested requirements. This is an Inochi2D toolchain, not a Cubism `.moc3` exporter.
+
+Build with `./build-aux/osx/AgentCliBuild.sh build --config=application`, then use
+the machine interface from the repository root:
 
 ```sh
-cd agent-cli
-dub run -- inspect model.inx
-dub run -- roundtrip input.inx output.inx
-dub run -- mesh-replace input.inx output.inx 42 replacement-mesh.json
-dub run -- mesh-replace-path input.inx output.inx /Eyes/Iris replacement-mesh.json
-dub run -- psd-inspect input.psd report.json
-dub run -- psd-import input.psd output.inx
-dub run -- sdk-validate output.inx
+agent-cli/inochi-agent --json capabilities
+agent-cli/inochi-agent --json schema rig
+agent-cli/inochi-agent --json psd-inspect input.psd report.json
+agent-cli/inochi-agent --json psd-import input.psd base.inx
+agent-cli/inochi-agent --json model-describe base.inx
+agent-cli/inochi-agent --json rig-validate base.inx rig.json
+agent-cli/inochi-agent --json rig-apply base.inx rigged.inx rig.json
+agent-cli/inochi-agent --json mesh-retopologize-path rigged.inx refined.inx /Eyes/Iris replacement-mesh.json
+agent-cli/inochi-agent --json pose-sample refined.inx poses.json
+agent-cli/inochi-agent --json pose-render refined.inx poses.json previews
 ```
 
 `roundtrip` validates the entire container before writing and retains its bytes
@@ -86,8 +95,9 @@ unchanged. `mesh-replace` validates an INX-native mesh JSON object
 (`verts`/`uvs`/`indices`/`origin`), normalizes triangle winding, replaces only
 the selected Part UUID's `mesh`, and retains all texture and extension payload
 bytes unchanged. When the Part already has a `deform` parameter binding, a
-vertex-count change is rejected until a deformation migration command exists;
-a same-topology coordinate adjustment remains safe. The GUI uses the same
+topology change is rejected; use `mesh-retopologize-path` to resample all existing
+deformation keys through unambiguous, covered UV coordinates. A same-topology
+coordinate adjustment retains the existing offsets. The GUI uses the same
 validation boundary before it asks Inochi2D to instantiate a puppet and
 textures.
 
@@ -115,12 +125,13 @@ the neutral artwork.
 opening a window or creating an OpenGL context. It verifies Part creation and
 all texture-slot references.
 
-For this Apple Silicon macOS development environment, the GUI build entry point
-is:
+For this Apple Silicon macOS development environment, the CLI verification and
+separate GUI build entry points are:
 
 ```sh
 ./build-aux/osx/AgentCliBuild.sh test --config=application
 ./build-aux/osx/AgentCliBuild.sh build --config=application
+python3 -m unittest discover -s tests -v
 ./build-aux/osx/AgentDevBuild.sh --build=debug
 ```
 
@@ -130,9 +141,12 @@ toolchain root through `INOCHI_AGENT_TOOLCHAIN`. The script locks the compatible
 Inochi2D, Numem, and i2d-imgui generations for this Creator revision, then
 builds an arm64 GUI. `AgentCliBuild.sh` applies the small upstream renderless
 guard required by Inochi2D 0.8.7 before building or testing the CLI. The
-renderer-independent container boundary is complete;
-per-Part mesh replacement and initial PSD import also run without the GUI.
-Parameter and deformer commands belong to the next Core extraction layers.
+CLI also patches SDK deformation deserialization. INX edits are staged before
+publication; machine-mode edits are SDK-validated. The legacy result-only
+commands remain available. The current synthetic acceptance tests exercise the
+macOS arm64 CLI, not the GUI or real-character artistic quality. CPU preview
+explicitly rejects unsupported blend modes, composites and tint effects;
+production visual acceptance still requires the real GPU runtime.
 
 ## Special Thanks
 

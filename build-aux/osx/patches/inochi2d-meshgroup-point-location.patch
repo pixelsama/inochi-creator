@@ -1,0 +1,137 @@
+--- a/source/inochi2d/core/nodes/meshgroup/package.d
++++ b/source/inochi2d/core/nodes/meshgroup/package.d
+@@ -39,7 +39,9 @@
+ @TypeId("MeshGroup")
+ class MeshGroup : Drawable {
+ protected:
+-    ushort[] bitMask;
++    enum float spatialBinSize = 8.0f;
++    size_t[][] triangleBins;
++    int binColumns;
+     vec4 bounds;
+     Triangle[] triangles;
+     vec2[] transformedVertices = [];
+@@ -70,6 +72,31 @@
+     */
+     this(Node parent = null) {
+         super(parent);
++    }
++
++
++    // A pixel can contain several cage regions. Test the actual point against
++    // source triangles and interpolate locally; never extrapolate from a pixel
++    // corner's triangle or multiply a cancellation-prone global affine matrix.
++    bool mapInsideTriangle(vec2 point, size_t index, out vec2 mapped) {
++        auto ai = data.indices[index * 3];
++        auto bi = data.indices[index * 3 + 1];
++        auto ci = data.indices[index * 3 + 2];
++        auto a = data.vertices[ai], b = data.vertices[bi], c = data.vertices[ci];
++        double bx = cast(double)b.x - a.x, by = cast(double)b.y - a.y;
++        double cx = cast(double)c.x - a.x, cy = cast(double)c.y - a.y;
++        double px = cast(double)point.x - a.x, py = cast(double)point.y - a.y;
++        double determinant = bx * cy - by * cx;
++        mapped = point;
++        if (abs(determinant) < 1e-15) return false;
++        double v = (px * cy - py * cx) / determinant;
++        double w = (bx * py - by * px) / determinant;
++        double u = 1.0 - v - w;
++        if (u < -2e-6 || v < -2e-6 || w < -2e-6) return false;
++        auto qa = transformedVertices[ai], qb = transformedVertices[bi], qc = transformedVertices[ci];
++        mapped = vec2(cast(float)(u * qa.x + v * qb.x + w * qc.x),
++                      cast(float)(u * qa.y + v * qb.y + w * qc.y));
++        return true;
+     }
+ 
+     Tuple!(vec2[], mat4*) filterChildren(vec2[] origVertices, vec2[] origDeformation, mat4* origTransform) {
+@@ -86,12 +113,15 @@
+                 cVertex = vec2(centerMatrix * vec4(vertex+origDeformation[i], 0, 1));
+             else
+                 cVertex = vec2(centerMatrix * vec4(vertex, 0, 1));
+-            int index = -1;
+-            if (bounds.x <= cVertex.x && cVertex.x < bounds.z && bounds.y <= cVertex.y && cVertex.y < bounds.w) {
+-                ushort bit = bitMask[cast(int)(cVertex.y - bounds.y) * cast(int)r.width + cast(int)(cVertex.x - bounds.x)];
+-                index = bit - 1;
+-            }
+-            vec2 newPos = (index < 0)? cVertex: (triangles[index].transformMatrix * vec3(cVertex, 1)).xy;
++            vec2 newPos = cVertex;
++            if (bounds.x <= cVertex.x && cVertex.x <= bounds.z &&
++                bounds.y <= cVertex.y && cVertex.y <= bounds.w) {
++                int bx = cast(int)((cVertex.x - bounds.x) / spatialBinSize);
++                int by = cast(int)((cVertex.y - bounds.y) / spatialBinSize);
++                foreach (index; triangleBins[by * binColumns + bx]) {
++                    if (mapInsideTriangle(cVertex, index, newPos)) break;
++                }
++            }
+             if (!dynamic) {
+                 mat4 inv = centerMatrix.inverse;
+                 inv[0][3] = 0;
+@@ -148,7 +178,7 @@
+     void precalculate() {
+         if (data.indices.length == 0) {
+             triangles.length = 0;
+-            bitMask.length   = 0;
++            triangleBins.length = 0;
+             return;
+         }
+ 
+@@ -205,33 +235,24 @@
+             triangles ~= t;
+         }
+ 
+-        // Construct bitMap
+-        int width  = cast(int)(ceil(bounds.z) - floor(bounds.x) + 1);
+-        int height = cast(int)(ceil(bounds.w) - floor(bounds.y) + 1);
+-        bitMask.length = width * height;
+-        bitMask[] = 0;
++        // Coarse bins only accelerate exact point-in-triangle queries. Every
++        // overlapping triangle is retained, including shared maximum edges.
++        binColumns = cast(int)ceil((bounds.z - bounds.x) / spatialBinSize) + 1;
++        int binRows = cast(int)ceil((bounds.w - bounds.y) / spatialBinSize) + 1;
++        triangleBins.length = binColumns * binRows;
++        foreach (ref bucket; triangleBins) bucket.length = 0;
+         foreach (size_t i, t; triangles) {
+-            vec2[3] tvertices = [
+-                data.vertices[data.indices[3*i]],
+-                data.vertices[data.indices[3*i+1]],
+-                data.vertices[data.indices[3*i+2]]
+-            ];
+-
+-            vec4 tbounds = getBounds(tvertices);
+-            int bwidth  = cast(int)(ceil(tbounds.z) - floor(tbounds.x) + 1);
+-            int bheight = cast(int)(ceil(tbounds.w) - floor(tbounds.y) + 1);
+-            int top  = cast(int)floor(tbounds.y);
+-            int left = cast(int)floor(tbounds.x);
+-            foreach (y; 0..bheight) {
+-                foreach (x; 0..bwidth) {
+-                    vec2 pt = vec2(left + x, top + y);
+-                    if (isPointInTriangle(pt, tvertices)) {
+-                        ushort id = cast(ushort)(i + 1);
+-                        pt-= bounds.xy;
+-                        bitMask[cast(int)(pt.y * width + pt.x)] = id;
+-                    }
+-                }
+-            }
++            vec2[3] corners = [data.vertices[data.indices[3*i]],
++                              data.vertices[data.indices[3*i+1]],
++                              data.vertices[data.indices[3*i+2]]];
++            auto box = getBounds(corners);
++            int x0 = cast(int)((box.x - bounds.x) / spatialBinSize);
++            int y0 = cast(int)((box.y - bounds.y) / spatialBinSize);
++            int x1 = cast(int)((box.z - bounds.x) / spatialBinSize);
++            int y1 = cast(int)((box.w - bounds.y) / spatialBinSize);
++            foreach (y; y0 .. y1 + 1)
++                foreach (x; x0 .. x1 + 1)
++                    triangleBins[y * binColumns + x] ~= i;
+         }
+ 
+         precalculated = true;
+@@ -431,7 +452,7 @@
+ 
+     void clearCache() {
+         precalculated = false;
+-        bitMask.length = 0;
++        triangleBins.length = 0;
+         triangles.length = 0;
+     }
+ }
+\ No newline at end of file

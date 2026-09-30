@@ -11,8 +11,9 @@ import inochi2d : Node, Part, Puppet, inClearUUIDs, inInit, inLoadINPPuppet;
 import inochi2d.core.param : DeformationParameterBinding;
 import inochi2d.core.nodes.defstack : Deformation;
 import inochi2d.fmt.serialize : inToJson;
-import inochi2d.math : vec2, vec2u;
+import inochi2d.math : vec2, vec2u, vec4;
 import inochi2d.integration : inCurrentPuppetTextureSlots;
+import inochi_agent.poseinput : agentSetPoseParameters;
 
 struct AgentSdkValidationSummary {
     string name;
@@ -47,9 +48,14 @@ struct AgentPoseProbeSummary {
     double declaredDeformationMagnitude = 0;
     size_t declaredDeformationVertexCount;
     size_t deformationBindingCount;
+    JSONValue[] worldVertices;
+    JSONValue[] vertexOffsets;
+    size_t flippedTriangleCount;
+    size_t collapsedTriangleCount;
 
     private static double finiteOrZero(double value) {
-        return isFinite(value) ? value : 0;
+        if (!isFinite(value)) throw new Exception("Pose probe contains a non-finite value.");
+        return value;
     }
 
     JSONValue toJson() const {
@@ -66,6 +72,10 @@ struct AgentPoseProbeSummary {
         object["declaredDeformationMagnitude"] = JSONValue(finiteOrZero(declaredDeformationMagnitude));
         object["declaredDeformationVertexCount"] = JSONValue(cast(ulong) declaredDeformationVertexCount);
         object["deformationBindingCount"] = JSONValue(cast(ulong) deformationBindingCount);
+        object["worldVertices"] = JSONValue(worldVertices.dup);
+        object["vertexOffsets"] = JSONValue(vertexOffsets.dup);
+        object["flippedTriangleCount"] = JSONValue(cast(ulong) flippedTriangleCount);
+        object["collapsedTriangleCount"] = JSONValue(cast(ulong) collapsedTriangleCount);
         return JSONValue(object);
     }
 }
@@ -192,8 +202,11 @@ private AgentPoseProbeSummary sampleProbe(
     auto transform = node.transform;
     AgentPoseProbeSummary result;
     result.path = path;
-    result.translationX = transform.translation.x;
-    result.translationY = transform.translation.y;
+    // The SDK's composed Transform.translation is derived from (1,1,1,1),
+    // not the local origin. Probe the matrix used by rendering instead.
+    auto origin = transform.matrix * vec4(0, 0, 0, 1);
+    result.translationX = origin.x;
+    result.translationY = origin.y;
     result.rotationZ = transform.rotation.z;
     result.scaleX = transform.scale.x;
     result.scaleY = transform.scale.y;
@@ -201,6 +214,32 @@ private AgentPoseProbeSummary sampleProbe(
     if (auto part = cast(Part) node) {
         result.opacity = node.getValue("opacity");
         result.deformationVertexCount = part.deformation.length;
+        auto mesh = part.getMesh();
+        if (part.deformation.length != mesh.vertices.length)
+            throw new Exception("Pose deformation does not match mesh vertex count.");
+        auto matrix = puppet.transform.matrix * part.getDynamicMatrix();
+        vec2[] posed;
+        foreach (i, vertex; mesh.vertices) {
+            auto offset = part.deformation[i];
+            if (!offset.isFinite) throw new Exception("Non-finite vertex deformation at " ~ path);
+            posed ~= vertex + offset;
+            auto world = matrix * vec4(vertex - mesh.origin + offset, 0, 1);
+            if (!isFinite(world.x) || !isFinite(world.y)) throw new Exception("Non-finite world vertex at " ~ path);
+            result.worldVertices ~= JSONValue([JSONValue(cast(double)world.x), JSONValue(cast(double)world.y)]);
+            result.vertexOffsets ~= JSONValue([JSONValue(cast(double)offset.x), JSONValue(cast(double)offset.y)]);
+        }
+        double area(vec2 a, vec2 b, vec2 c) {
+            return (cast(double)b.x-a.x)*(cast(double)c.y-a.y) - (cast(double)b.y-a.y)*(cast(double)c.x-a.x);
+        }
+        foreach (t; 0 .. mesh.indices.length / 3) {
+            auto a = mesh.indices[t*3], b = mesh.indices[t*3+1], c = mesh.indices[t*3+2];
+            if (a >= posed.length || b >= posed.length || c >= posed.length)
+                throw new Exception("Pose mesh triangle index is out of range.");
+            double before = area(mesh.vertices[a], mesh.vertices[b], mesh.vertices[c]);
+            double after = area(posed[a], posed[b], posed[c]);
+            if (abs(after) <= 1e-8) result.collapsedTriangleCount++;
+            else if (before * after < 0) result.flippedTriangleCount++;
+        }
         foreach (offset; part.deformation) {
             if (offset.isFinite) {
                 result.deformationMagnitude += abs(offset.x) + abs(offset.y);
@@ -212,8 +251,8 @@ private AgentPoseProbeSummary sampleProbe(
                 result.deformationBindingCount++;
                 auto deformBinding = cast(DeformationParameterBinding) binding;
                 if (deformBinding is null) continue;
-                foreach (x; 0 .. parameter.axisPointCount(0)) {
-                    ref value = deformBinding.getValue(vec2u(cast(uint) x, 0));
+                foreach (x; 0 .. parameter.axisPointCount(0)) foreach (y; 0 .. parameter.axisPointCount(1)) {
+                    ref value = deformBinding.getValue(vec2u(cast(uint) x, cast(uint) y));
                     result.declaredDeformationVertexCount = value.vertexOffsets.size;
                     foreach (offset; value.vertexOffsets) {
                         if (offset.isFinite) {
@@ -270,33 +309,23 @@ AgentPoseReport agentSamplePoses(string modelPath, JSONValue specification) {
         if (!("parameters" in pose.object) || pose["parameters"].type != JSONType.object) {
             throw new Exception(poseLabel ~ " requires a parameters object.");
         }
-        if (!("probes" in pose.object) || pose["probes"].type != JSONType.array) {
-            throw new Exception(poseLabel ~ " requires a probes array.");
+        auto probes = pose.object.get("probes", JSONValue.init);
+        if (probes.type == JSONType.null_) {
+            JSONValue[] paths;
+            void collect(Node node, string parent, bool root = false) {
+                auto path = root ? "" : parent ~ "/" ~ node.name;
+                if (cast(Part)node) paths ~= JSONValue(path);
+                foreach (child; node.children) collect(child, path);
+            }
+            collect(puppet.root, "", true);
+            probes = JSONValue(paths);
         }
+        if (probes.type != JSONType.array) throw new Exception(poseLabel ~ " probes must be an array.");
 
         foreach (parameter; puppet.parameters) {
             parameter.value = parameter.defaults;
         }
-        foreach (name, value; pose["parameters"].object) {
-            auto parameterIndex = puppet.findParameterIndex(name);
-            if (parameterIndex < 0) {
-                throw new Exception("Pose references unknown parameter '" ~ name ~ "'.");
-            }
-            auto parameter = puppet.parameters[parameterIndex];
-            if (parameter.isVec2) {
-                throw new Exception(
-                    "Pose sampling currently requires scalar parameter '" ~ name ~ "'."
-                );
-            }
-            double requested = readPoseNumber(value, "Pose parameter '" ~ name ~ "'");
-            if (requested < parameter.min.x || requested > parameter.max.x) {
-                throw new Exception(
-                    "Pose parameter '" ~ name ~ "' is outside its declared range."
-                );
-            }
-            parameter.value.x = cast(float) requested;
-            parameter.value.y = 0;
-        }
+        agentSetPoseParameters(puppet, pose["parameters"], poseLabel);
         // Pose sampling is intentionally deterministic: apply declared
         // parameters without running automation or physics drivers.
         puppet.root.beginUpdate();
@@ -308,7 +337,7 @@ AgentPoseReport agentSamplePoses(string modelPath, JSONValue specification) {
 
         AgentPoseSummary poseSummary;
         poseSummary.name = pose["name"].str;
-        foreach (probeValue; pose["probes"].array) {
+        foreach (probeValue; probes.array) {
             if (probeValue.type != JSONType.string) {
                 throw new Exception(poseLabel ~ " probe paths must be strings.");
             }

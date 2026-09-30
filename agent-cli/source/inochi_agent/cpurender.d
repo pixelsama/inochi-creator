@@ -16,7 +16,8 @@ import inochi2d : Node, Part, Puppet, inClearUUIDs, inInit, inLoadINPPuppet,
 import inochi2d.core.nodes.common : MaskingMode;
 import inochi2d.math : mat4, vec2, vec4;
 
-import creator.agentcore.modelio : AgentTextureBlob, agentReadModelTextures;
+import creator.agentcore.modelio : AgentTextureBlob, agentReadModelTextures, agentReadModelPayload;
+import inochi_agent.poseinput : agentSetPoseParameters;
 
 struct AgentRenderPoseSummary {
     string name;
@@ -24,6 +25,7 @@ struct AgentRenderPoseSummary {
     size_t nonTransparentPixelCount;
     size_t physicsFrameCount;
     double[] physicsParameterValues;
+    double[2][string] physicsParameters;
     string rgbaSha256;
 
     JSONValue toJson() const {
@@ -39,6 +41,11 @@ struct AgentRenderPoseSummary {
             physicsValues ~= JSONValue(value);
         }
         object["physicsParameterValues"] = JSONValue(physicsValues);
+        JSONValue[string] namedPhysics;
+        foreach (name, value; physicsParameters) {
+            namedPhysics[name] = JSONValue([JSONValue(value[0]), JSONValue(value[1])]);
+        }
+        object["physicsParameters"] = JSONValue(namedPhysics);
         object["rgbaSha256"] = JSONValue(rgbaSha256);
         return JSONValue(object);
     }
@@ -47,6 +54,7 @@ struct AgentRenderPoseSummary {
 struct AgentRenderReport {
     int width;
     int height;
+    int supersample = 1;
     size_t poseCount;
     AgentRenderPoseSummary[] poses;
 
@@ -57,6 +65,7 @@ struct AgentRenderReport {
         JSONValue[string] object;
         object["width"] = JSONValue(width);
         object["height"] = JSONValue(height);
+        object["supersample"] = JSONValue(supersample);
         object["poseCount"] = JSONValue(cast(ulong) poseCount);
         object["poses"] = JSONValue(poseValues);
         return JSONValue(object).toString();
@@ -160,14 +169,14 @@ private float edge(vec2 a, vec2 b, vec2 p) {
         (p.y - a.y) * (b.x - a.x);
 }
 
-private vec2 worldToPixel(vec4 world, int width, int height) {
+private vec2 worldToPixel(vec4 world, int width, int height, int rasterScale) {
     return vec2(
-        world.x + width / 2.0f,
-        world.y + height / 2.0f
+        world.x * rasterScale + width / 2.0f,
+        world.y * rasterScale + height / 2.0f
     );
 }
 
-private ubyte[] sampleBilinear(
+private ubyte[4] sampleBilinear(
     ref DecodedTexture texture,
     float u,
     float v
@@ -183,7 +192,7 @@ private ubyte[] sampleBilinear(
     float tx = sourceX - x0;
     float ty = sourceY - y0;
 
-    ubyte[] result = new ubyte[4];
+    ubyte[4] result;
     foreach (channel; 0 .. 4) {
         float top = texture.rgba[(y0 * texture.width + x0) * 4 + channel] *
                 (1 - tx) +
@@ -312,6 +321,14 @@ private void renderTriangle(
 ) {
     float area = edge(p0, p1, p2);
     if (abs(area) < 0.00001f) return;
+    if (area < 0) {
+        auto point = p1; p1 = p2; p2 = point;
+        auto uv = uv1; uv1 = uv2; uv2 = uv;
+        area = -area;
+    }
+    bool topLeft(vec2 a, vec2 b) {
+        return b.y > a.y || (b.y == a.y && b.x < a.x);
+    }
 
     int minimumX = max(
         0,
@@ -334,12 +351,17 @@ private void renderTriangle(
     foreach (y; minimumY .. maximumY + 1) {
         foreach (x; minimumX .. maximumX + 1) {
             vec2 point = vec2(x + 0.5f, y + 0.5f);
-            float w0 = edge(p1, p2, point) / area;
-            float w1 = edge(p2, p0, point) / area;
-            float w2 = edge(p0, p1, point) / area;
-            if (w0 < -0.0001f || w1 < -0.0001f || w2 < -0.0001f) {
+            float e0 = edge(p1, p2, point);
+            float e1 = edge(p2, p0, point);
+            float e2 = edge(p0, p1, point);
+            // Each shared edge belongs to exactly one triangle. Inclusive
+            // barycentric tests blend semi-transparent mesh diagonals twice.
+            if (e0 < 0 || (e0 == 0 && !topLeft(p1, p2)) ||
+                e1 < 0 || (e1 == 0 && !topLeft(p2, p0)) ||
+                e2 < 0 || (e2 == 0 && !topLeft(p0, p1))) {
                 continue;
             }
+            float w0 = e0 / area, w1 = e1 / area, w2 = e2 / area;
 
             float u = uv0.x * w0 + uv1.x * w1 + uv2.x * w2;
             float v = uv0.y * w0 + uv1.y * w1 + uv2.y * w2;
@@ -360,7 +382,8 @@ private void renderPartInto(
     Part part,
     ref DecodedTexture[] textures,
     int width,
-    int height
+    int height,
+    int rasterScale
 ) {
     if (!part.renderEnabled || part.textureIds.length == 0) return;
     int textureId = part.textureIds[0];
@@ -387,7 +410,8 @@ private void renderPartInto(
         pixelVertices[index] = worldToPixel(
             matrix * vec4(local, 0, 1),
             width,
-            height
+            height,
+            rasterScale
         );
     }
 
@@ -418,7 +442,8 @@ private void applyPartMasks(
     Part part,
     ref DecodedTexture[] textures,
     int width,
-    int height
+    int height,
+    int rasterScale
 ) {
     if (part.masks.length == 0) return;
 
@@ -435,7 +460,8 @@ private void applyPartMasks(
             maskPart,
             textures,
             width,
-            height
+            height,
+            rasterScale
         );
         if (binding.mode == MaskingMode.Mask) {
             hasPositiveMask = true;
@@ -461,7 +487,8 @@ private void applyPartMasks(
             maskPart,
             textures,
             width,
-            height
+            height,
+            rasterScale
         );
         foreach (pixel; 0 .. combined.length) {
             float alpha = maskCanvas[pixel * 4 + 3] / 255.0f;
@@ -486,7 +513,8 @@ private ubyte[] renderPuppet(
     Puppet puppet,
     ref DecodedTexture[] textures,
     int width,
-    int height
+    int height,
+    int rasterScale
 ) {
     auto canvas = new ubyte[cast(size_t) width * height * 4];
     RenderPart[] parts;
@@ -504,7 +532,8 @@ private ubyte[] renderPuppet(
             part,
             textures,
             width,
-            height
+            height,
+            rasterScale
         );
         applyPartMasks(
             layer,
@@ -512,11 +541,34 @@ private ubyte[] renderPuppet(
             part,
             textures,
             width,
-            height
+            height,
+            rasterScale
         );
         blendPremultipliedCanvas(canvas, layer);
     }
     return canvas;
+}
+
+// Box filtering premultiplied channels prevents transparent edge colors from
+// darkening the final straight-alpha PNG. Raster scale never changes SDK state.
+private ubyte[] downsamplePremultiplied(
+    ubyte[] source, int width, int height, int scale
+) {
+    if (scale == 1) return source;
+    auto result = new ubyte[cast(size_t) width * height * 4];
+    int sourceWidth = width * scale;
+    uint count = scale * scale;
+    foreach (y; 0 .. height) foreach (x; 0 .. width) {
+        uint[4] sum;
+        foreach (dy; 0 .. scale) foreach (dx; 0 .. scale) {
+            size_t sourceOffset = (cast(size_t)(y * scale + dy) * sourceWidth + x * scale + dx) * 4;
+            foreach (channel; 0 .. 4) sum[channel] += source[sourceOffset + channel];
+        }
+        size_t offset = (cast(size_t)y * width + x) * 4;
+        foreach (channel; 0 .. 4)
+            result[offset + channel] = cast(ubyte)((sum[channel] + count / 2) / count);
+    }
+    return result;
 }
 
 private void setPoseParameters(
@@ -524,29 +576,7 @@ private void setPoseParameters(
     JSONValue parameters,
     string label
 ) {
-    if (parameters.type != JSONType.object) {
-        throw new Exception(label ~ " requires a parameters object.");
-    }
-    foreach (name, value; parameters.object) {
-        auto parameterIndex = puppet.findParameterIndex(name);
-        if (parameterIndex < 0) {
-            throw new Exception("Pose references unknown parameter '" ~ name ~ "'.");
-        }
-        auto parameter = puppet.parameters[parameterIndex];
-        if (parameter.isVec2) {
-            throw new Exception(
-                "Pose rendering currently requires scalar parameter '" ~ name ~ "'."
-            );
-        }
-        double requested = readNumber(value, "Pose parameter '" ~ name ~ "'");
-        if (requested < parameter.min.x || requested > parameter.max.x) {
-            throw new Exception(
-                "Pose parameter '" ~ name ~ "' is outside its declared range."
-            );
-        }
-        parameter.value.x = cast(float) requested;
-        parameter.value.y = 0;
-    }
+    agentSetPoseParameters(puppet, parameters, label);
 }
 
 private void applyPose(Puppet puppet, JSONValue pose, size_t poseIndex) {
@@ -574,7 +604,12 @@ private void applyPose(Puppet puppet, JSONValue pose, size_t poseIndex) {
         pose["parameters"],
         label ~ " parameters"
     );
-    puppet.update();
+    // Static poses evaluate all explicit parameters, including driven axes.
+    // Only simulatePhysics advances automation and physics state.
+    puppet.root.beginUpdate();
+    foreach (parameter; puppet.parameters) parameter.update();
+    puppet.root.transformChanged();
+    puppet.root.update();
 }
 
 private size_t simulatePhysics(Puppet puppet, JSONValue pose, size_t poseIndex) {
@@ -629,6 +664,14 @@ private size_t simulatePhysics(Puppet puppet, JSONValue pose, size_t poseIndex) 
     return frames;
 }
 
+private double[2][string] namedPhysicsParameters(Puppet puppet) {
+    double[2][string] values;
+    foreach (parameter, driver; puppet.getParameterDrivers()) {
+        values[parameter.name] = [cast(double)parameter.value.x, cast(double)parameter.value.y];
+    }
+    return values;
+}
+
 private double[] physicsParameterValues(Puppet puppet) {
     double[] values;
     foreach (parameter, driver; puppet.getParameterDrivers()) {
@@ -642,6 +685,27 @@ AgentRenderReport agentRenderPoses(
     JSONValue specification,
     string outputDirectory
 ) {
+    // This renderer is an explicit subset of the GPU runtime. Reject assets
+    // we cannot faithfully preview, rather than silently producing wrong art.
+    auto payload = agentReadModelPayload(modelPath);
+    void checkNode(JSONValue node) {
+        string type = node.object.get("type", JSONValue("Node")).str;
+        if (type != "Node" && type != "Part" && type != "SimplePhysics" && type != "MeshGroup")
+            throw new Exception("CPU renderer does not support node type '" ~ type ~ "'; use the GPU runtime.");
+        if (type == "Part") {
+            if (node.object.get("blend_mode", JSONValue("Normal")).str != "Normal")
+                throw new Exception("CPU renderer supports Normal blending only; use the GPU runtime.");
+            foreach (field; ["tint", "screenTint"]) {
+                if (field in node.object) {
+                    foreach (v; node[field].array)
+                        if (readNumber(v, field) != (field == "tint" ? 1 : 0))
+                            throw new Exception("CPU renderer does not support tint; use the GPU runtime.");
+                }
+            }
+        }
+        foreach (child; node.object.get("children", JSONValue.emptyArray).array) checkNode(child);
+    }
+    checkNode(payload["nodes"]);
     if (
         specification.type != JSONType.object ||
         !("canvas" in specification.object) ||
@@ -662,6 +726,13 @@ AgentRenderReport agentRenderPoses(
     }
     int width = readPositiveInteger(canvas["width"], "Canvas width");
     int height = readPositiveInteger(canvas["height"], "Canvas height");
+    int supersample = 1;
+    if ("supersample" in canvas.object)
+        supersample = readPositiveInteger(canvas["supersample"], "Canvas supersample");
+    if (supersample > 4)
+        throw new Exception("Canvas supersample must be an integer from 1 to 4.");
+    if (cast(ulong)width * height > 16_777_216UL / (supersample * supersample))
+        throw new Exception("CPU raster exceeds 16777216 pixels including supersampling; reduce canvas size or supersample.");
 
     if (!sdkInitialized) {
         renderClock = 0;
@@ -686,10 +757,13 @@ AgentRenderReport agentRenderPoses(
     AgentRenderReport report;
     report.width = width;
     report.height = height;
+    report.supersample = supersample;
     foreach (poseIndex, pose; specification["poses"].array) {
         applyPose(puppet, pose, poseIndex);
         auto physicsFrameCount = simulatePhysics(puppet, pose, poseIndex);
-        auto premultiplied = renderPuppet(puppet, textures, width, height);
+        auto premultiplied = renderPuppet(
+            puppet, textures, width * supersample, height * supersample, supersample);
+        premultiplied = downsamplePremultiplied(premultiplied, width, height, supersample);
         auto rgba = straightAlphaCopy(premultiplied);
         string filename = format(
             "%02s_%s.png",
@@ -709,6 +783,7 @@ AgentRenderReport agentRenderPoses(
         poseSummary.outputPath = outputPath;
         poseSummary.physicsFrameCount = physicsFrameCount;
         poseSummary.physicsParameterValues = physicsParameterValues(puppet);
+        poseSummary.physicsParameters = namedPhysicsParameters(puppet);
         foreach (pixel; 0 .. rgba.length / 4) {
             if (rgba[pixel * 4 + 3] > 0) poseSummary.nonTransparentPixelCount++;
         }

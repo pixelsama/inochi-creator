@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+# Pass the deployment triple to every compilation without replacing DUB's
+# unittest/release flags (DFLAGS would replace the selected build type).
+AGENT_TOOLCHAIN=${INOCHI_AGENT_TOOLCHAIN:-"$HOME/.local/share/inochi-agent/toolchain/ldc2-1.41.0-osx-arm64"}
+exec "$AGENT_TOOLCHAIN/bin/ldc2" \
+    "-mtriple=arm64-apple-macosx${MACOSX_DEPLOYMENT_TARGET:-13.0}" "$@"

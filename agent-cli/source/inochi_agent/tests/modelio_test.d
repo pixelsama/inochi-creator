@@ -3,6 +3,7 @@ module inochi_agent.tests.modelio_test;
 import std.bitmanip : bigEndianToNative, nativeToBigEndian;
 import std.file : exists, read, remove, rmdirRecurse, write;
 import std.json : JSONType, JSONValue, parseJSON;
+import std.math : abs;
 import std.path : buildPath;
 import std.process : environment;
 import std.string : representation;
@@ -278,6 +279,44 @@ private JSONValue simpleRigSpec() {
                             {"profiles":[{"type":"tipX","amount":-2}]},
                             null,
                             {"profiles":[{"type":"tipX","amount":2}]}
+                        ]
+                    }
+                ]
+            }
+        ]
+    }`);
+}
+
+private JSONValue curveMorphRigSpec() {
+    return parseJSON(`{
+        "meshes":[
+            {"path":"/Eyes/Iris","columns":3,"rows":3}
+        ],
+        "parameters":[
+            {
+                "name":"Blink",
+                "min":0,
+                "max":1,
+                "default":0,
+                "keys":[0,1],
+                "bindings":[
+                    {
+                        "path":"/Eyes/Iris",
+                        "property":"deform",
+                        "values":[
+                            null,
+                            {
+                                "profiles":[{
+                                    "type":"curveMorph",
+                                    "amount":1,
+                                    "offsetY":4,
+                                    "curvatureY":6,
+                                    "slopeY":3,
+                                    "anchorLeft":0.5,
+                                    "thicknessScale":0.2,
+                                    "widthScale":0.8
+                                }]
+                            }
                         ]
                     }
                 ]
@@ -567,12 +606,12 @@ unittest {
     assert(iris["masks"].array[0]["source"] == sclera["uuid"]);
     assert(iris["masks"].array[0]["mode"].str == "Mask");
 
+    foreach (scale; [1, 2, 3, 4]) {
+    auto renderSpec = parseJSON(`{"canvas":{"width":32,"height":32},"poses":[{"name":"masked","parameters":{}}]}`);
+    renderSpec["canvas"]["supersample"] = JSONValue(scale);
     auto report = agentRenderPoses(
         rigPath,
-        parseJSON(`{
-            "canvas":{"width":32,"height":32},
-            "poses":[{"name":"masked","parameters":{}}]
-        }`),
+        renderSpec,
         outputDirectory
     );
     auto rendered = read_image(report.poses[0].outputPath, 4, 8);
@@ -592,6 +631,7 @@ unittest {
         rendered.buf8[insideMask + 2] >= 198 &&
         rendered.buf8[insideMask + 2] <= 201
     );
+    }
 }
 
 unittest {
@@ -630,6 +670,61 @@ unittest {
     auto deformation = parameter["bindings"].array[2];
     assert(deformation["values"].array.length == 3);
     assert(deformation["values"].array[0].array[0].array.length == 6);
+}
+
+unittest {
+    string inputPath = testPath("inochi-agent-curve-morph-input.inx");
+    string outputPath = testPath("inochi-agent-curve-morph-output.inx");
+
+    scope(exit) {
+        if (exists(inputPath)) remove(inputPath);
+        if (exists(outputPath)) remove(outputPath);
+    }
+
+    write(inputPath, createFixture());
+    auto summary = agentApplyRigSpec(inputPath, outputPath, curveMorphRigSpec());
+    assert(summary.meshedPartCount == 1);
+
+    auto payload = agentReadModelPayload(outputPath);
+    auto part = payload["nodes"]["children"].array[0];
+    auto vertices = part["mesh"]["verts"].array;
+    auto parameter = payload["param"].array[$ - 1];
+    auto offsets = parameter["bindings"].array[0]["values"].array[1].array[0].array;
+    assert(vertices.length == 18);
+    assert(offsets.length == 9);
+
+    double minX = double.infinity;
+    double minY = double.infinity;
+    double maxX = -double.infinity;
+    double maxY = -double.infinity;
+    foreach (index; 0 .. vertices.length / 2) {
+        double x = vertices[index * 2].floating;
+        double y = vertices[index * 2 + 1].floating;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+    }
+    double centerX = (minX + maxX) * 0.5;
+    double centerY = (minY + maxY) * 0.5;
+    double halfWidth = (maxX - minX) * 0.5;
+    double halfHeight = (maxY - minY) * 0.5;
+
+    foreach (index; 0 .. offsets.length) {
+        double x = vertices[index * 2].floating;
+        double y = vertices[index * 2 + 1].floating;
+        double normalizedX = (x - centerX) / halfWidth;
+        double normalizedY = (y - centerY) / halfHeight;
+        double expectedX = centerX + normalizedX * halfWidth * 0.8;
+        double expectedCurveY = centerY + 4 +
+            6 * (1 - normalizedX * normalizedX) + 3 * normalizedX;
+        double expectedY = expectedCurveY + normalizedY * halfHeight * 0.2;
+        double unitX = (normalizedX + 1) * 0.5;
+        double blend = unitX >= 0.5 ? 1 : unitX / 0.5;
+        double influence = blend * blend * (3 - 2 * blend);
+        assert(abs(offsets[index].array[0].floating - (expectedX - x) * influence) < 0.0001);
+        assert(abs(offsets[index].array[1].floating - (expectedY - y) * influence) < 0.0001);
+    }
 }
 
 unittest {

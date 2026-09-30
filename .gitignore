@@ -44,3 +44,5 @@ build-aux/windows/wix/bin
 # Agent Core/CLI build products
 /agent-cli/inochi-agent*
 /agent-core/*.a
+__pycache__/
+*.pyc

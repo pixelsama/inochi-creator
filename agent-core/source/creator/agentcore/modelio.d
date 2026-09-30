@@ -282,6 +282,47 @@ private string requiredString(JSONValue object, string key, string label) {
     return object[key].str;
 }
 
+private void requireFields(JSONValue value, string[] allowed, string label) {
+    import std.algorithm : canFind;
+    if (value.type != JSONType.object) throw new Exception(label ~ " must be an object.");
+    foreach (key, ignored; value.object) {
+        if (!allowed.canFind(key)) throw new Exception(label ~ " has unknown field '" ~ key ~ "'.");
+    }
+}
+
+private struct RigAxis {
+    double minimum, maximum, defaultValue;
+    double[] keys;
+    double[] normalized;
+}
+
+private RigAxis readRigAxis(JSONValue request, string label) {
+    RigAxis a;
+    a.minimum = readFiniteNumber(objectField(request, "min", JSONValue(0.0)), label ~ " min");
+    a.maximum = readFiniteNumber(objectField(request, "max", JSONValue(1.0)), label ~ " max");
+    a.defaultValue = readFiniteNumber(objectField(request, "default", JSONValue(0.0)), label ~ " default");
+    if (a.minimum >= a.maximum || a.defaultValue < a.minimum || a.defaultValue > a.maximum)
+        throw new Exception(label ~ " has invalid range or default.");
+    auto values = objectField(request, "keys", JSONValue.init);
+    if (values.type != JSONType.array || values.array.length < 2)
+        throw new Exception(label ~ " requires at least two keys.");
+    foreach (v; values.array) {
+        double key = readFiniteNumber(v, label ~ " key");
+        if (key < a.minimum || key > a.maximum || (a.keys.length && key <= a.keys[$-1]))
+            throw new Exception(label ~ " keys must increase within the range.");
+        double normalized = (key - a.minimum) / (a.maximum - a.minimum);
+        if (!isFinite(cast(float)normalized) || (a.normalized.length &&
+            cast(float)normalized <= cast(float)a.normalized[$-1]))
+            throw new Exception(label ~ " keys collapse at SDK float precision.");
+        a.keys ~= key;
+        a.normalized ~= normalized;
+    }
+    // SDK interpolation needs end points, including for nonuniform axes.
+    if (a.keys[0] != a.minimum || a.keys[$-1] != a.maximum)
+        throw new Exception(label ~ " keys must cover both range endpoints.");
+    return a;
+}
+
 private JSONValue numberArray(const(double)[] values) {
     JSONValue[] result;
     result.reserve(values.length);
@@ -383,8 +424,8 @@ private double readFiniteNumber(JSONValue value, string label) {
             throw new Exception(format("%s must be a number.", label));
     }
 
-    if (!isFinite(result)) {
-        throw new Exception(format("%s must be finite.", label));
+    if (!isFinite(result) || !isFinite(cast(float)result)) {
+        throw new Exception(format("%s must be finite and fit the SDK float range.", label));
     }
     return result;
 }
@@ -420,6 +461,7 @@ private JSONValue normalizeMesh(JSONValue requested, out size_t vertexCount, out
     if (requested.type != JSONType.object) {
         throw new Exception("Mesh must be a JSON object.");
     }
+    requireFields(requested, ["verts", "uvs", "indices", "origin", "grid_axes"], "Mesh");
 
     auto normalized = parseJSON(requested.toString());
     auto vertices = requireMeshField(normalized, "verts");
@@ -738,6 +780,126 @@ AgentMeshSummary agentReplacePartMeshByPsdPath(
     );
 }
 
+/** Resample every deformation key in UV space, including both parameter axes.
+ * New UVs must lie in the old triangulation. Textures, parameter identities,
+ * interpolation modes, non-deform bindings and extension bytes are retained.
+ */
+AgentMeshSummary agentRetopologizePartByPsdPath(
+    string inputPath, string outputPath, string path, JSONValue requestedMesh
+) {
+    auto document = parseInx(cast(const(ubyte)[])read(inputPath));
+    ulong uuid = requirePartUuidByPsdPath(document.payload, path);
+    auto tree = document.payload["nodes"];
+    JSONValue oldMesh;
+    if (!findPartMesh(tree, uuid, oldMesh)) throw new Exception("Retopology Part not found.");
+    size_t vertexCount, triangleCount;
+    auto mesh = normalizeMesh(requestedMesh, vertexCount, triangleCount);
+    auto oldUV = requireMeshField(oldMesh, "uvs");
+    auto newUV = requireMeshField(mesh, "uvs");
+    auto oldCount = meshVertexCount(oldMesh, "Source mesh");
+    validateNumericArray(oldUV, oldCount * 2, "Source UVs");
+    validateNumericArray(newUV, vertexCount * 2, "Destination UVs");
+    auto indices = requireMeshField(oldMesh, "indices");
+    if (indices.type != JSONType.array || indices.array.length % 3 != 0)
+        throw new Exception("Source mesh must contain complete triangles.");
+    struct Transfer { size_t[3] vertices; double[3] weights; }
+    Transfer[] transfers;
+    foreach (v; 0 .. vertexCount) {
+        double u = readFiniteNumber(newUV[v*2], "u");
+        double w = readFiniteNumber(newUV[v*2+1], "v");
+        bool found;
+        Transfer transfer;
+        foreach (t; 0 .. indices.array.length / 3) {
+            size_t[3] ids;
+            double[3] xs, ys;
+            foreach (i; 0 .. 3) {
+                ids[i] = cast(size_t)readIndex(indices[t*3+i], "Source index");
+                if (ids[i] >= oldCount) throw new Exception("Source index is out of range.");
+                xs[i] = readFiniteNumber(oldUV[ids[i]*2], "Source u");
+                ys[i] = readFiniteNumber(oldUV[ids[i]*2+1], "Source v");
+            }
+            double determinant = (ys[1]-ys[2])*(xs[0]-xs[2]) + (xs[2]-xs[1])*(ys[0]-ys[2]);
+            if (abs(determinant) < 1e-12) continue;
+            double a = ((ys[1]-ys[2])*(u-xs[2]) + (xs[2]-xs[1])*(w-ys[2])) / determinant;
+            double b = ((ys[2]-ys[0])*(u-xs[2]) + (xs[0]-xs[2])*(w-ys[2])) / determinant;
+            double c = 1 - a - b;
+            if (a < -1e-7 || b < -1e-7 || c < -1e-7) continue;
+            if (found) {
+                // Shared edges are safe only when both triangles describe the
+                // same weighted source vertices. Disconnected UV islands can
+                // disagree even at corners, where no weight is strictly interior.
+                double[size_t] difference;
+                double[3] weights = [a,b,c];
+                foreach (i; 0 .. 3) {
+                    difference[transfer.vertices[i]] = difference.get(transfer.vertices[i], 0.0) + transfer.weights[i];
+                    difference[ids[i]] = difference.get(ids[i], 0.0) - weights[i];
+                }
+                foreach (delta; difference) if (abs(delta) > 1e-6)
+                    throw new Exception("Overlapping source UV triangles make retopology ambiguous.");
+            }
+            if (!found) { transfer = Transfer(ids, [a,b,c]); found = true; }
+        }
+        if (!found) throw new Exception(format("Destination vertex %s is outside source UV coverage.", v));
+        transfers ~= transfer;
+    }
+    auto parameters = objectField(document.payload, "param", JSONValue.emptyArray);
+    foreach (ref parameter; parameters.array) {
+        if (!("bindings" in parameter.object)) continue;
+        foreach (ref binding; parameter["bindings"].array) {
+            if (binding["param_name"].str != "deform" || readIndex(binding["node"], "Binding node") != uuid) continue;
+            foreach (ref column; binding["values"].array) foreach (ref cell; column.array) {
+                if (cell.type != JSONType.array || cell.array.length != oldCount)
+                    throw new Exception("Existing deformation key does not match source topology.");
+                foreach (pair; cell.array) validateNumericArray(pair, 2, "Existing vertex offset");
+                JSONValue[] offsets;
+                foreach (tr; transfers) {
+                    double dx = 0, dy = 0;
+                    foreach (i; 0 .. 3) {
+                        dx += tr.weights[i] * readFiniteNumber(cell[tr.vertices[i]][0], "Offset x");
+                        dy += tr.weights[i] * readFiniteNumber(cell[tr.vertices[i]][1], "Offset y");
+                    }
+                    offsets ~= numberArray([dx,dy]);
+                }
+                cell = JSONValue(offsets);
+            }
+        }
+    }
+    document.payload.object["param"] = parameters;
+    if (!replacePartMesh(tree, uuid, mesh)) throw new Exception("Retopology target disappeared.");
+    document.payload.object["nodes"] = tree;
+    write(outputPath, serializeInx(document));
+    return AgentMeshSummary(uuid, vertexCount, triangleCount);
+}
+
+/** Rename an explicitly selected non-root node without changing PSD provenance,
+ * UUIDs, texture bytes, geometry or parameter binding identities. */
+JSONValue agentRenameNode(string inputPath, string outputPath, ulong uuid, string name) {
+    import std.string : indexOf;
+    if (!name.length || name == "Root" || name == "." || name == ".." || name.indexOf('/') >= 0)
+        throw new Exception("Node name must be a nonempty path segment other than Root, . or ..");
+    auto document = parseInx(cast(const(ubyte)[])read(inputPath));
+    size_t matches;
+    void visit(ref JSONValue parent) {
+        if (!("children" in parent.object)) return;
+        auto children = parent["children"].array;
+        foreach (ref child; children) {
+            if (readIndex(child["uuid"], "Node uuid") == uuid) {
+                foreach (sibling; children)
+                    if (readIndex(sibling["uuid"], "Sibling uuid") != uuid && sibling["name"].str == name)
+                        throw new Exception("Node name already exists among siblings.");
+                child["name"] = JSONValue(name);
+                matches++;
+            }
+            visit(child);
+        }
+        parent["children"] = JSONValue(children);
+    }
+    visit(document.payload["nodes"]);
+    if (matches != 1) throw new Exception("Node UUID must select exactly one non-root node.");
+    write(outputPath, serializeInx(document));
+    return JSONValue(["uuid": JSONValue(uuid), "name": JSONValue(name)]);
+}
+
 private size_t mutateNodesByPath(
     ref JSONValue node,
     string parentPath,
@@ -990,11 +1152,22 @@ private void applyRigPhysics(
 
     foreach (physicsIndex, physicsRequest; physics.array) {
         string label = format("Physics request %s", physicsIndex);
+        requireFields(physicsRequest, ["name", "parent", "parameter", "model_type", "map_mode",
+            "output_scale", "gravity", "length", "frequency", "angle_damping", "length_damping", "local_only"], label);
         string name = requiredString(physicsRequest, "name", label);
         string parentPath = requiredString(physicsRequest, "parent", label);
         string parameterName = requiredString(physicsRequest, "parameter", label);
         string modelType = requiredString(physicsRequest, "model_type", label);
         string mapMode = requiredString(physicsRequest, "map_mode", label);
+        foreach (field; ["length", "frequency", "angle_damping", "length_damping"]) {
+            if (!(field in physicsRequest.object)) continue;
+            double value = readFiniteNumber(physicsRequest[field], label ~ " " ~ field);
+            if ((field == "length" || field == "frequency") ? value <= 0 : (value < 0 || value > 1))
+                throw new Exception(label ~ " invalid " ~ field ~ " (length/frequency > 0; damping in [0,1]).");
+        }
+        if ("local_only" in physicsRequest.object && physicsRequest["local_only"].type != JSONType.true_ &&
+            physicsRequest["local_only"].type != JSONType.false_)
+            throw new Exception(label ~ " local_only must be boolean.");
         if (modelType == "pendulum") modelType = "Pendulum";
         if (modelType == "spring_pendulum") modelType = "SpringPendulum";
         if (mapMode == "angle_length") mapMode = "AngleLength";
@@ -1099,6 +1272,7 @@ private void applyRigGroups(
 
     foreach (groupIndex, groupRequest; groups.array) {
         string label = format("Group request %s", groupIndex);
+        requireFields(groupRequest, ["name", "paths", "pivot", "zsort"], label);
         string name = requiredString(groupRequest, "name", label);
         auto paths = objectField(groupRequest, "paths", JSONValue(JSONValue[].init));
         if (paths.type != JSONType.array || paths.array.length == 0) {
@@ -1169,7 +1343,7 @@ private JSONValue buildGridMesh(JSONValue existingMesh, size_t columns, size_t r
     if (columns < 2 || rows < 2) {
         throw new Exception("Grid mesh columns and rows must both be at least two.");
     }
-    if (columns * rows > ushort.max + 1) {
+    if (columns > ushort.max + 1 || rows > (ushort.max + 1) / columns) {
         throw new Exception("Grid mesh exceeds INX 16-bit vertex indices.");
     }
 
@@ -1270,6 +1444,7 @@ private void applyRigMasks(
 
     foreach (maskIndex, maskRequest; masks.array) {
         string label = format("Mask request %s", maskIndex);
+        requireFields(maskRequest, ["target", "source", "mode"], label);
         string targetPath = requiredString(maskRequest, "target", label);
         string sourcePath = requiredString(maskRequest, "source", label);
         string mode = requiredString(maskRequest, "mode", label);
@@ -1404,6 +1579,11 @@ private double optionalProfileNumber(JSONValue profile, string key) {
     return readFiniteNumber(profile[key], format("Deformation profile '%s'", key));
 }
 
+private double profileNumberOr(JSONValue profile, string key, double fallback) {
+    if (!(key in profile.object)) return fallback;
+    return readFiniteNumber(profile[key], format("Deformation profile '%s'", key));
+}
+
 private JSONValue deformationForMesh(JSONValue mesh, JSONValue request, string label) {
     auto vertices = requireMeshField(mesh, "verts");
     if (
@@ -1413,6 +1593,16 @@ private JSONValue deformationForMesh(JSONValue mesh, JSONValue request, string l
     ) {
         throw new Exception(format("%s targets a Part without a valid mesh.", label));
     }
+
+    if (request.type == JSONType.object && "offsets" in request.object) {
+        requireFields(request, ["offsets"], label);
+        auto values = request["offsets"];
+        if (values.type != JSONType.array || values.array.length != vertices.array.length / 2)
+            throw new Exception(label ~ " offsets must match mesh vertex count.");
+        foreach (index, pair; values.array) validateNumericArray(pair, 2, format("%s offsets[%s]", label, index));
+        return values;
+    }
+    if (request.type != JSONType.null_) requireFields(request, ["profiles"], label);
 
     double minX = double.infinity;
     double minY = double.infinity;
@@ -1472,6 +1662,8 @@ private JSONValue deformationForMesh(JSONValue mesh, JSONValue request, string l
 
         foreach (profileIndex, profile; profiles) {
             string profileLabel = format("%s profile[%s]", label, profileIndex);
+            requireFields(profile, ["type", "amount", "x", "y", "widthScale", "thicknessScale",
+                "offsetY", "curvatureY", "slopeY", "anchorLeft", "anchorRight"], profileLabel);
             string profileType = requiredString(profile, "type", profileLabel);
             double amount = optionalProfileNumber(profile, "amount");
             switch (profileType) {
@@ -1513,6 +1705,37 @@ private JSONValue deformationForMesh(JSONValue mesh, JSONValue request, string l
                 case "pinchY":
                     dy += amount * normalizedY * (1 - abs(normalizedY));
                     break;
+                case "curveMorph": {
+                    double widthScale = profileNumberOr(profile, "widthScale", 1);
+                    double thicknessScale = profileNumberOr(
+                        profile,
+                        "thicknessScale",
+                        1
+                    );
+                    double offsetY = optionalProfileNumber(profile, "offsetY");
+                    double curvatureY = optionalProfileNumber(profile, "curvatureY");
+                    double slopeY = optionalProfileNumber(profile, "slopeY");
+                    double targetX = centerX + normalizedX * halfWidth * widthScale;
+                    double targetCurveY = centerY + offsetY +
+                        curvatureY * (1 - normalizedX * normalizedX) +
+                        slopeY * normalizedX;
+                    double targetY = targetCurveY +
+                        normalizedY * halfHeight * thicknessScale;
+                    double influence = 1;
+                    double unitX = (normalizedX + 1) * 0.5;
+                    foreach (anchor; ["anchorLeft", "anchorRight"]) {
+                        double width = optionalProfileNumber(profile, anchor);
+                        if (width < 0 || width > 1) throw new Exception(profileLabel ~ " anchor width must be in [0,1].");
+                        if (width > 0) {
+                            import std.algorithm : clamp;
+                            double t = clamp((anchor == "anchorLeft" ? unitX : 1 - unitX) / width, 0.0, 1.0);
+                            influence *= t * t * (3 - 2 * t);
+                        }
+                    }
+                    dx += amount * (targetX - x) * influence;
+                    dy += amount * (targetY - y) * influence;
+                    break;
+                }
                 default:
                     throw new Exception(format(
                         "%s uses unsupported deformation profile '%s'.",
@@ -1521,7 +1744,7 @@ private JSONValue deformationForMesh(JSONValue mesh, JSONValue request, string l
                     ));
             }
         }
-        if (!isFinite(dx) || !isFinite(dy)) {
+        if (!isFinite(dx) || !isFinite(dy) || !isFinite(cast(float)dx) || !isFinite(cast(float)dy)) {
             throw new Exception(format(
                 "%s produced a non-finite offset at vertex %s (%s, %s), normalized (%s, %s).",
                 label,
@@ -1571,9 +1794,9 @@ AgentRigSummary agentApplyRigSpec(
     string outputPath,
     JSONValue specification
 ) {
-    if (specification.type != JSONType.object) {
-        throw new Exception("Rig specification must be a JSON object.");
-    }
+    requireFields(specification, ["schema_version", "groups", "masks", "meshes", "parameters", "physics"], "Rig specification");
+    if ("schema_version" in specification.object && readIndex(specification["schema_version"], "schema_version") != 1)
+        throw new Exception("Unsupported rig schema_version; expected 1.");
     auto document = parseInx(cast(const(ubyte)[]) read(inputPath));
     AgentRigSummary summary;
     auto existingParameters = objectField(
@@ -1613,9 +1836,16 @@ AgentRigSummary agentApplyRigSpec(
     if (meshes.type != JSONType.array) {
         throw new Exception("Rig specification meshes must be an array.");
     }
+    bool[string] meshPaths;
     foreach (index, meshRequest; meshes.array) {
         string label = format("Mesh request %s", index);
+        requireFields(meshRequest, ["path", "mesh", "columns", "rows"], label);
         string path = requiredString(meshRequest, "path", label);
+        if (path in meshPaths) throw new Exception(label ~ " duplicates mesh path '" ~ path ~ "'.");
+        meshPaths[path] = true;
+        bool custom = ("mesh" in meshRequest.object) !is null;
+        if (custom && ("columns" in meshRequest.object || "rows" in meshRequest.object))
+            throw new Exception(label ~ " cannot combine custom mesh and grid dimensions.");
         size_t columns = cast(size_t) readIndex(
             objectField(meshRequest, "columns", JSONValue(0)),
             label ~ " columns"
@@ -1628,11 +1858,16 @@ AgentRigSummary agentApplyRigSpec(
             if (objectField(node, "type", JSONValue("")).str != "Part") {
                 throw new Exception(format("Grid target '%s' is not a Part.", path));
             }
-            node.object["mesh"] = buildGridMesh(
-                requireMeshField(node, "mesh"),
-                columns,
-                rows
-            );
+            auto oldMesh = requireMeshField(node, "mesh");
+            size_t vertexCount, triangleCount;
+            auto newMesh = custom
+                ? normalizeMesh(meshRequest["mesh"], vertexCount, triangleCount)
+                : buildGridMesh(oldMesh, columns, rows);
+            if (custom && !("uvs" in newMesh.object)) throw new Exception(label ~ " custom mesh requires uvs.");
+            if (hasDeformationBinding(document.payload, readIndex(node["uuid"], "Part uuid")) &&
+                (meshVertexCount(oldMesh, label) != meshVertexCount(newMesh, label) || !hasSameIndices(oldMesh, newMesh)))
+                throw new Exception(label ~ " changes bound mesh topology; rebuild from an unbound base or migrate deformation keys first.");
+            node.object["mesh"] = newMesh;
         });
         summary.meshedPartCount++;
     }
@@ -1646,9 +1881,13 @@ AgentRigSummary agentApplyRigSpec(
         throw new Exception("Rig specification parameters must be an array.");
     }
 
+    bool[string] parameterNames;
     foreach (parameterIndex, parameterRequest; parameters.array) {
         string parameterLabel = format("Parameter request %s", parameterIndex);
+        requireFields(parameterRequest, ["name", "min", "max", "default", "keys", "axes", "bindings"], parameterLabel);
         string name = requiredString(parameterRequest, "name", parameterLabel);
+        if (name in parameterNames) throw new Exception("Duplicate parameter '" ~ name ~ "'.");
+        parameterNames[name] = true;
         ptrdiff_t existingParameterIndex = -1;
         foreach (index, existingParameter; existingParameters.array) {
             if (
@@ -1661,45 +1900,23 @@ AgentRigSummary agentApplyRigSpec(
                 break;
             }
         }
-        double minimum = readFiniteNumber(
-            objectField(parameterRequest, "min", JSONValue(0.0)),
-            name ~ " min"
-        );
-        double maximum = readFiniteNumber(
-            objectField(parameterRequest, "max", JSONValue(1.0)),
-            name ~ " max"
-        );
-        double defaultValue = readFiniteNumber(
-            objectField(parameterRequest, "default", JSONValue(0.0)),
-            name ~ " default"
-        );
-        if (minimum >= maximum) {
-            throw new Exception(format("Parameter '%s' min must be below max.", name));
-        }
-        if (defaultValue < minimum || defaultValue > maximum) {
-            throw new Exception(format("Parameter '%s' default is outside its range.", name));
-        }
-
-        auto keysValue = objectField(parameterRequest, "keys", JSONValue.init);
-        if (keysValue.type != JSONType.array || keysValue.array.length < 2) {
-            throw new Exception(format("Parameter '%s' requires at least two keys.", name));
-        }
-        double[] keys;
-        foreach (keyIndex, keyValue; keysValue.array) {
-            double key = readFiniteNumber(keyValue, format("%s keys[%s]", name, keyIndex));
-            if (key < minimum || key > maximum) {
-                throw new Exception(format("Parameter '%s' key is outside its range.", name));
-            }
-            if (keys.length > 0 && key <= keys[$ - 1]) {
-                throw new Exception(format("Parameter '%s' keys must be strictly increasing.", name));
-            }
-            keys ~= key;
-        }
-
-        double[] axisPoints;
-        foreach (key; keys) axisPoints ~= (key - minimum) / (maximum - minimum);
-        JSONValue[] axes = [numberArray(axisPoints), numberArray([0.0])];
+        bool isVec2 = ("axes" in parameterRequest.object) !is null;
+        RigAxis xAxis, yAxis;
+        yAxis.minimum = 0; yAxis.maximum = 1; yAxis.defaultValue = 0;
+        yAxis.keys = [0]; yAxis.normalized = [0];
+        if (isVec2) {
+            foreach (field; ["min", "max", "default", "keys"])
+                if (field in parameterRequest.object) throw new Exception(name ~ " cannot mix axes and scalar fields.");
+            auto requestedAxes = parameterRequest["axes"];
+            if (requestedAxes.type != JSONType.array || requestedAxes.array.length != 2)
+                throw new Exception(name ~ " axes must contain exactly two axis objects.");
+            foreach (axis; requestedAxes.array) requireFields(axis, ["min", "max", "default", "keys"], name ~ " axis");
+            xAxis = readRigAxis(requestedAxes[0], name ~ " X");
+            yAxis = readRigAxis(requestedAxes[1], name ~ " Y");
+        } else xAxis = readRigAxis(parameterRequest, name);
+        JSONValue[] axes = [numberArray(xAxis.normalized), numberArray(yAxis.normalized)];
         JSONValue[] bindings;
+        bool[string] bindingTargets;
         auto bindingRequests = objectField(
             parameterRequest,
             "bindings",
@@ -1711,12 +1928,20 @@ AgentRigSummary agentApplyRigSpec(
 
         foreach (bindingIndex, bindingRequest; bindingRequests.array) {
             string bindingLabel = format("%s binding[%s]", name, bindingIndex);
+            requireFields(bindingRequest, ["path", "property", "values", "interpolation"], bindingLabel);
             string path = requiredString(bindingRequest, "path", bindingLabel);
             string property = requiredString(bindingRequest, "property", bindingLabel);
             ulong nodeUuid;
             string nodeType;
             JSONValue mesh;
             inspectRigTarget(document.payload, path, nodeUuid, nodeType, mesh);
+            string identity = format("%s:%s", nodeUuid, property);
+            if (identity in bindingTargets) throw new Exception(bindingLabel ~ " duplicates a target property.");
+            bindingTargets[identity] = true;
+            string interpolation = "interpolation" in bindingRequest.object
+                ? requiredString(bindingRequest, "interpolation", bindingLabel) : "Linear";
+            if (interpolation != "Linear" && interpolation != "Nearest" && interpolation != "Cubic")
+                throw new Exception(bindingLabel ~ " interpolation must be Linear, Nearest or Cubic.");
 
             bool isDeformation = property == "deform";
             bool isOpacity = property == "opacity";
@@ -1752,20 +1977,30 @@ AgentRigSummary agentApplyRigSpec(
             JSONValue[string] binding;
             binding["node"] = JSONValue(nodeUuid);
             binding["param_name"] = JSONValue(property);
-            binding["values"] = isDeformation
-                ? deformationBindingValues(
-                    mesh,
-                    objectField(bindingRequest, "values", JSONValue.init),
-                    keys.length,
-                    bindingLabel
-                )
-                : numericBindingValues(
-                    objectField(bindingRequest, "values", JSONValue.init),
-                    keys.length,
-                    bindingLabel
-                );
-            binding["isSet"] = bindingSetFlags(keys.length);
-            binding["interpolate_mode"] = JSONValue("Linear");
+            auto requestedValues = objectField(bindingRequest, "values", JSONValue.init);
+            if (requestedValues.type != JSONType.array || requestedValues.array.length != xAxis.keys.length)
+                throw new Exception(bindingLabel ~ " values must match X key count.");
+            JSONValue[] valueGrid, flagGrid;
+            foreach (x, column; requestedValues.array) {
+                auto cells = isVec2 ? column : JSONValue([column]);
+                if (cells.type != JSONType.array || cells.array.length != yAxis.keys.length)
+                    throw new Exception(bindingLabel ~ " values[x] must match Y key count (X-major order).");
+                JSONValue[] values, flags;
+                foreach (y, cell; cells.array) {
+                    string cellLabel = format("%s values[%s][%s]", bindingLabel, x, y);
+                    if (isDeformation) values ~= deformationForMesh(mesh, cell, cellLabel);
+                    else {
+                        double v = readFiniteNumber(cell, cellLabel);
+                        if (isOpacity && (v < 0 || v > 1)) throw new Exception(cellLabel ~ " opacity must be in [0,1].");
+                        values ~= JSONValue(v);
+                    }
+                    flags ~= JSONValue(true);
+                }
+                valueGrid ~= JSONValue(values); flagGrid ~= JSONValue(flags);
+            }
+            binding["values"] = JSONValue(valueGrid);
+            binding["isSet"] = JSONValue(flagGrid);
+            binding["interpolate_mode"] = JSONValue(interpolation);
             bindings ~= JSONValue(binding);
             summary.bindingCount++;
         }
@@ -1775,10 +2010,10 @@ AgentRigSummary agentApplyRigSpec(
             ? existingParameters.array[existingParameterIndex]["uuid"]
             : JSONValue(nextUuid++);
         parameter["name"] = JSONValue(name);
-        parameter["is_vec2"] = JSONValue(false);
-        parameter["min"] = numberArray([minimum, 0.0]);
-        parameter["max"] = numberArray([maximum, 1.0]);
-        parameter["defaults"] = numberArray([defaultValue, 0.0]);
+        parameter["is_vec2"] = JSONValue(isVec2);
+        parameter["min"] = numberArray([xAxis.minimum, yAxis.minimum]);
+        parameter["max"] = numberArray([xAxis.maximum, yAxis.maximum]);
+        parameter["defaults"] = numberArray([xAxis.defaultValue, yAxis.defaultValue]);
         parameter["axis_points"] = JSONValue(axes);
         parameter["merge_mode"] = JSONValue("Additive");
         parameter["bindings"] = JSONValue(bindings);

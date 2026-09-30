@@ -15,6 +15,10 @@ if [ ! -x "$TOOLCHAIN_ROOT/bin/ldc2" ]; then
 fi
 
 export PATH="$TOOLCHAIN_ROOT/bin:$PATH"
+# LDC 1.41 predates the macOS version-number change. An explicit deployment
+# triple avoids deriving invalid macOS 18 from newer Darwin host versions.
+export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-13.0}
+export INOCHI_AGENT_TOOLCHAIN="$TOOLCHAIN_ROOT"
 
 if [ ! -d "$INOCHI2D_DIR/.git" ]; then
     mkdir -p "$DEPS_ROOT"
@@ -46,6 +50,20 @@ else
     exit 1
 fi
 
+INOCHI2D_MESHGROUP_PATCH="$ROOT/build-aux/osx/patches/inochi2d-meshgroup-point-location.patch"
+if git -C "$INOCHI2D_DIR" apply --reverse --check "$INOCHI2D_MESHGROUP_PATCH" >/dev/null 2>&1; then
+    :
+elif git -C "$INOCHI2D_DIR" apply --check "$INOCHI2D_MESHGROUP_PATCH" >/dev/null 2>&1; then
+    git -C "$INOCHI2D_DIR" apply "$INOCHI2D_MESHGROUP_PATCH"
+else
+    echo "The Inochi2D MeshGroup patch does not match $INOCHI2D_DIR." >&2
+    exit 1
+fi
+
+# Local registrations are relative to the invoking package's cache. Register
+# from the same directory as describe/build/test, otherwise DUB silently picks
+# an unpatched registry copy for agent-cli.
+cd "$ROOT/agent-cli"
 dub add-local "$INOCHI2D_DIR" 0.8.7 --cache=local >/dev/null
 
 ACTION=${1:-build}
@@ -53,5 +71,4 @@ if [ "$#" -gt 0 ]; then
     shift
 fi
 
-cd "$ROOT/agent-cli"
-exec dub "$ACTION" --cache=local --compiler=ldc2 "$@"
+exec dub "$ACTION" --cache=local --compiler="$ROOT/build-aux/osx/agent-ldc2" "$@"
