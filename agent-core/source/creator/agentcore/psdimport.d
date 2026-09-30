@@ -39,6 +39,8 @@ struct AgentPsdImportDocument {
     int height;
     size_t sourceLayerRecordCount;
     AgentPsdImportLayer[] layers;
+    /// Pixel layers without pixel bounds; they draw nothing and are not imported.
+    string[] skippedEmptyLayers;
 }
 
 struct AgentPsdImportSummary {
@@ -47,6 +49,7 @@ struct AgentPsdImportSummary {
     size_t groupCount;
     size_t partCount;
     size_t textureCount;
+    string[] skippedEmptyLayers;
 
     string toJson() const {
         JSONValue[string] object;
@@ -55,6 +58,9 @@ struct AgentPsdImportSummary {
         object["groupCount"] = JSONValue(cast(ulong) groupCount);
         object["partCount"] = JSONValue(cast(ulong) partCount);
         object["textureCount"] = JSONValue(cast(ulong) textureCount);
+        JSONValue[] skipped;
+        foreach (path; skippedEmptyLayers) skipped ~= JSONValue(path);
+        object["skippedEmptyLayers"] = JSONValue(skipped);
         return JSONValue(object).toString();
     }
 }
@@ -541,7 +547,10 @@ AgentPsdImportDocument agentReadPsdForImport(string path) {
             continue;
         }
         if (layer.width == 0 || layer.height == 0) {
-            throw new Exception(format("PSD layer '%s' has empty pixel bounds.", entry.path));
+            // An empty pixel layer contributes nothing to the image, so dropping
+            // it preserves appearance. It is reported instead of rejected.
+            document.skippedEmptyLayers ~= entry.path;
+            continue;
         }
         foreach (channel; layer.channels) {
             if (
@@ -592,6 +601,7 @@ AgentPsdImportSummary agentImportPsdToInx(string inputPath, string outputPath) {
     AgentPsdImportSummary summary;
     summary.sourcePath = inputPath;
     summary.outputPath = outputPath;
+    summary.skippedEmptyLayers = document.skippedEmptyLayers;
     foreach (layer; document.layers) {
         if (layer.isGroup) {
             summary.groupCount++;

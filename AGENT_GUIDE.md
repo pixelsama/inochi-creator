@@ -215,6 +215,10 @@ python3 tools/gpu_acceptance.py rigged.inx poses.json gpu-check --camera-scale 0
 
 `pose-sample` 和未声明物理帧的 `pose-render` 只评估静态参数，不推进自动化或物理；显式传入的物理驱动参数也会被应用，静态结果不依赖前一个姿态。`pose-render` 的 pose 可声明 `physics:{"frames":60,"dt":0.0166666667}`，可选 trajectory 数组需与 frames 等长；轨迹每帧是参数对象。渲染结果返回文件路径、像素数量、RGBA hash 与物理统计。 其中 `physicsParameters` 按实际驱动参数名称返回 `[x,y]` 两轴值，可结合轨迹最后一帧的普通参数，独立重放同一画面或用 `pose-sample` 复验几何。旧 `physicsParameterValues` 数组仍保留兼容；其字典遍历顺序不应当作参数身份。
 
+动作预览可在同一 pose 的 physics 中加 `capture_every:N`：在一次模拟中每 N 帧写出一张 `<序号>_<名称>_f<帧号>.png`，路径列在 `frameOutputPaths`，最后仍写出常规结果图。连续动画因此只需模拟一次，而不必为每一帧单独建 pose 并从头模拟。
+
+PSD 导入会跳过没有像素范围的空图层（它们不影响画面），并在结果的 `skippedEmptyLayers` 中列出其路径。
+
 ## 写入与兼容性
 
 机器模式下，INX 修改先写入目标目录下的唯一 staging 子目录，通过 SDK 验证后原子 rename；失败保留既有目标文件，且不删除别的调用留下的 `.agent-incomplete` 文件。允许显式原地编辑，但建议保留 base 与重要迭代版本。并发写同一目标仍是最后完成者覆盖，调用方应串行化同一模型的写入。

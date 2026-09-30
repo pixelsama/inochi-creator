@@ -14,16 +14,29 @@ ROOT = Path(__file__).resolve().parents[1]
 CLI = Path(os.environ.get("INOCHI_AGENT_TEST_CLI", ROOT / "agent-cli/inochi-agent"))
 
 
-def synthetic_psd():
-    """32x32 RGB PSD, one ordinary four-channel 4x4 pixel layer."""
+def synthetic_psd(empty_layer=False):
+    """32x32 RGB PSD, one ordinary four-channel 4x4 pixel layer.
+
+    With empty_layer, an extra pixel layer with zero bounds sits above it."""
     u32 = lambda n: struct.pack(">I", n)
     header = b"8BPS" + struct.pack(">H6sHIIHH", 1, b"\0" * 6, 4, 32, 32, 8, 3)
-    extra = u32(0) + u32(0) + b"\x04Iris\0\0\0"
-    record = struct.pack(">iiiiH", 14, 14, 18, 18, 4)
-    record += b"".join(struct.pack(">hI", c, 18) for c in [-1, 0, 1, 2])
-    record += b"8BIMnorm" + bytes([255, 0, 0, 0]) + u32(len(extra)) + extra
+
+    def layer(name, bounds, channel_length):
+        pascal = bytes([len(name)]) + name
+        pascal += b"\0" * (-len(pascal) % 4)
+        extra = u32(0) + u32(0) + pascal
+        record = struct.pack(">iiiiH", *bounds, 4)
+        record += b"".join(struct.pack(">hI", c, channel_length) for c in [-1, 0, 1, 2])
+        return record + b"8BIMnorm" + bytes([255, 0, 0, 0]) + u32(len(extra)) + extra
+
+    records = layer(b"Iris", (14, 14, 18, 18), 18)
     pixels = b"".join(b"\0\0" + bytes([v]) * 16 for v in [255, 200, 80, 40])
-    info = struct.pack(">h", 1) + record + pixels
+    count = 1
+    if empty_layer:
+        records += layer(b"Empty", (0, 0, 0, 0), 2)
+        pixels += b"\0\0" * 4
+        count = 2
+    info = struct.pack(">h", count) + records + pixels
     section = u32(len(info)) + info + u32(0)
     return header + u32(0) + u32(0) + u32(len(section)) + section + b"\0\0" + bytes(4096)
 
@@ -68,6 +81,30 @@ class AgentCLIContracts(unittest.TestCase):
         self.assertIn("rig-validate", caps["commands"])
         self.assertIn(2, caps["parameter_dimensions"])
         self.call("unknown-command", ok=False, code="USAGE_ERROR")
+
+    def test_empty_pixel_layer_is_skipped_and_reported(self):
+        self.psd.write_bytes(synthetic_psd(empty_layer=True))
+        summary = self.call("psd-import", self.psd, self.model)["import"]
+        self.assertEqual(summary["partCount"], 1)
+        self.assertEqual(summary["skippedEmptyLayers"], ["/Empty"])
+        self.assertEqual(self.call("sdk-validate", self.model)["partCount"], 1)
+
+    def test_physics_render_captures_trajectory_frames(self):
+        self.import_model()
+        self.call("rig-apply", self.model, self.model, self.rig)
+        trajectory = [{"HeadXY": [x, 0]} for x in (-1, -0.5, 0.5, 1)]
+        poses = self.directory / "motion.json"
+        poses.write_text(json.dumps({"canvas": {"width": 32, "height": 32}, "poses": [
+            {"name": "motion", "parameters": {},
+             "physics": {"frames": 4, "dt": 0.05, "trajectory": trajectory, "capture_every": 2}}]}))
+        pose = self.call("pose-render", self.model, poses, self.directory / "motion")["poses"][0]
+        frames = [Path(p) for p in pose["frameOutputPaths"]]
+        self.assertEqual([p.name for p in frames], ["00_motion_f00002.png", "00_motion_f00004.png"])
+        self.assertNotEqual(frames[0].read_bytes(), frames[1].read_bytes())
+        self.assertEqual(frames[1].read_bytes(), Path(pose["outputPath"]).read_bytes())
+        poses.write_text(json.dumps({"canvas": {"width": 32, "height": 32}, "poses": [
+            {"name": "bad", "parameters": {}, "physics": {"frames": 4, "capture_every": 0}}]}))
+        self.call("pose-render", self.model, poses, self.directory / "bad", ok=False, code="VALIDATION_ERROR")
 
     def test_discoverable_rig_schema(self):
         schema = self.call("schema", "rig")

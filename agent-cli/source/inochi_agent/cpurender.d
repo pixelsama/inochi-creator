@@ -27,6 +27,7 @@ struct AgentRenderPoseSummary {
     double[] physicsParameterValues;
     double[2][string] physicsParameters;
     string rgbaSha256;
+    string[] frameOutputPaths;
 
     JSONValue toJson() const {
         JSONValue[string] object;
@@ -47,6 +48,9 @@ struct AgentRenderPoseSummary {
         }
         object["physicsParameters"] = JSONValue(namedPhysics);
         object["rgbaSha256"] = JSONValue(rgbaSha256);
+        JSONValue[] frames;
+        foreach (path; frameOutputPaths) frames ~= JSONValue(path);
+        object["frameOutputPaths"] = JSONValue(frames);
         return JSONValue(object);
     }
 }
@@ -741,7 +745,23 @@ private void applyPose(Puppet puppet, JSONValue pose, size_t poseIndex) {
     puppet.root.update();
 }
 
-private size_t simulatePhysics(Puppet puppet, JSONValue pose, size_t poseIndex) {
+/// Reads the optional physics.capture_every stride (0 = final frame only).
+private size_t captureStride(JSONValue pose, size_t poseIndex) {
+    if (!("physics" in pose.object) || pose["physics"].type != JSONType.object) return 0;
+    auto physics = pose["physics"];
+    if (!("capture_every" in physics.object)) return 0;
+    return cast(size_t) readPositiveInteger(
+        physics["capture_every"],
+        format("Pose %s physics capture_every", poseIndex)
+    );
+}
+
+private size_t simulatePhysics(
+    Puppet puppet,
+    JSONValue pose,
+    size_t poseIndex,
+    void delegate(size_t frame) onFrame = null
+) {
     if (!("physics" in pose.object)) return 0;
     auto physics = pose["physics"];
     string label = format("Pose %s physics", poseIndex);
@@ -789,6 +809,7 @@ private size_t simulatePhysics(Puppet puppet, JSONValue pose, size_t poseIndex) 
         renderClock += dt;
         inUpdate();
         puppet.update();
+        if (onFrame !is null) onFrame(frame);
     }
     return frames;
 }
@@ -908,27 +929,40 @@ AgentRenderReport agentRenderPoses(
     report.height = height;
     report.supersample = supersample;
     report.legacyBlendFallbacks = fallbacks;
-    foreach (poseIndex, pose; specification["poses"].array) {
-        applyPose(puppet, pose, poseIndex);
-        auto physicsFrameCount = simulatePhysics(puppet, pose, poseIndex);
+    ubyte[] renderTo(string outputPath) {
         auto raster = renderPuppet(
             puppet, textures, width * supersample, height * supersample, supersample);
         auto premultiplied = downsamplePremultiplied(raster, width, height, supersample);
         auto rgba = straightAlphaCopy(premultiplied);
-        string filename = format(
-            "%02s_%s.png",
-            poseIndex,
-            safeFilename(pose["name"].str, poseIndex)
-        );
-        string outputPath = buildPath(outputDirectory, filename);
         auto error = write_image(outputPath, width, height, rgba, 4);
         if (error != 0) {
             throw new Exception(
                 format("Could not write pose PNG '%s': %s.", outputPath, IF_ERROR[error])
             );
         }
+        return rgba;
+    }
+
+    foreach (poseIndex, pose; specification["poses"].array) {
+        applyPose(puppet, pose, poseIndex);
+        string stem = format("%02s_%s", poseIndex, safeFilename(pose["name"].str, poseIndex));
+        // capture_every renders intermediate simulation frames in one pass,
+        // so a motion preview costs one simulation instead of one per frame.
+        size_t stride = captureStride(pose, poseIndex);
+        string[] framePaths;
+        void captureFrame(size_t frame) {
+            if ((frame + 1) % stride != 0) return;
+            string framePath = buildPath(outputDirectory, format("%s_f%05s.png", stem, frame + 1));
+            renderTo(framePath);
+            framePaths ~= framePath;
+        }
+        auto physicsFrameCount = simulatePhysics(
+            puppet, pose, poseIndex, stride > 0 ? &captureFrame : null);
+        string outputPath = buildPath(outputDirectory, stem ~ ".png");
+        auto rgba = renderTo(outputPath);
 
         AgentRenderPoseSummary poseSummary;
+        poseSummary.frameOutputPaths = framePaths;
         poseSummary.name = pose["name"].str;
         poseSummary.outputPath = outputPath;
         poseSummary.physicsFrameCount = physicsFrameCount;
