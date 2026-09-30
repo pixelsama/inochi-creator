@@ -43,3 +43,34 @@ acceptance checks original-source/texture preservation, neutral-image error and
 Completion means the above contracts are verified, not that every Inochi Creator
 GUI feature or automatic artistic decision has been implemented. Remaining
 limitations are recorded in AGENT_GUIDE.md.
+
+## Advanced rig round (2026-09-29)
+
+Scope: make the Inochi2D features needed for a production avatar operable by
+Agents, and make the CPU preview trustworthy against the real GPU runtime.
+
+| Requirement | Executable verification | State |
+| --- | --- | --- |
+| MeshGroup cages can be created (grid over children or custom mesh) and deformed by parameters; children follow | rigext_test.d: translated cage moves every child vertex and rendered pixels; test_agent_cli.py | PASS |
+| zSort can be driven by parameters | rigext_test.d: overlapping parts swap front/back; probe reports zSort | PASS |
+| tint / screenTint are bindable on Parts and Composites; static appearance via `parts` | rigext_test.d: rendered colors and probe values; negative ranges rejected | PASS |
+| All SDK blend modes can be set and are previewed with the macOS runtime's legacy GL formulas, only where the part rasterizes | rigext_test.d: Multiply result, DestinationIn leaves outside pixels intact; fallbacks reported | PASS |
+| Composite groups (rig and PSD import) flatten children before opacity/blend; nesting rejected | rigext_test.d: overlap alpha stays 0.5; PSD group with opacity imports as Composite | PASS |
+| Sine automation can be authored and survives SDK loading | rigext_test.d: automation moves a part over simulated frames; invalid bindings rejected | PASS; SDK range/enum deserialization bugs fixed or avoided |
+| Parts can be auto-meshed from texture alpha, including bound parts via retopology | rigext_test.d: rest pose within 1/255 of the quad, area follows silhouette, keys migrate; Gate2 89 parts pixel-identical | PASS |
+| CPU preview matches the GPU runtime | tools/gpu_acceptance.py on the shounen trial and Gate2 PSD | PASS at 1:1 (max channel diff 2); <1% pixels over 8/255 at 0.25–0.5 scale |
+
+CPU renderer corrections found by GPU comparison (previous behavior differed
+from the runtime): GL texel-center addressing with a transparent border,
+trilinear mipmaps with UV-aligned area-weighted levels, binary stencil masks
+using the mask source's raw alpha and mask_threshold, and OpenGL's coverage
+tie rule in y-up window coordinates. The Agent Session capture also wrote
+premultiplied framebuffer colors into straight-alpha PNGs; it now
+unpremultiplies before encoding.
+
+Verification record, macOS arm64, LDC 1.41.0 (CLI) / 1.42.0 (Session):
+
+- D suite: 5 modules pass, including the new rigext_test.d.
+- Python public CLI suite: 9 integration tests pass against the release build.
+- Session D suite: 5 modules pass; Agent Session bundle rebuilt.
+- Shounen trial acceptance (test_trial.py) still passes.

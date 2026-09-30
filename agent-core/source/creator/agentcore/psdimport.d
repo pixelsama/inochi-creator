@@ -210,36 +210,43 @@ private JSONValue buildNodeJson(
     ImportTreeNode treeNode,
     AgentPsdImportDocument document,
     ref uint nextUuid,
-    ref ubyte[][] textureBlobs
+    ref ubyte[][] textureBlobs,
+    bool insideComposite = false
 ) {
     auto layer = treeNode.layer;
     uint uuid = nextUuid++;
 
     if (layer.isGroup) {
-        if (
-            layer.blendMode.length > 0 &&
-            layer.blendMode != "norm" &&
-            layer.blendMode != "pass"
-        ) {
+        // Isolated PSD groups (non-pass blending or reduced opacity) become
+        // Composites, which render children offscreen and blend the result.
+        bool composite = layer.opacity != 255 ||
+            (layer.blendMode.length > 0 && layer.blendMode != "norm" && layer.blendMode != "pass");
+        if (composite && insideComposite) {
             throw new Exception(format(
-                "PSD group '%s' uses blend mode '%s'; importing it as a plain node would change appearance.",
-                layer.path,
-                layer.blendMode
+                "PSD group '%s' needs a Composite inside another Composite; Inochi2D flattens nested composites.",
+                layer.path
             ));
         }
-        if (layer.opacity != 255) {
-            throw new Exception(format(
-                "PSD group '%s' has opacity %s; plain Inochi2D nodes cannot preserve group opacity.",
-                layer.path,
-                layer.opacity
-            ));
+        if (composite) {
+            auto node = baseNodeJson(uuid, layer.name, "Composite", layer.visible, 0);
+            node.object["blend_mode"] = JSONValue(inochiBlendMode(layer.blendMode == "pass" ? "norm" : layer.blendMode));
+            node.object["tint"] = jsonArray([1.0, 1.0, 1.0]);
+            node.object["screenTint"] = jsonArray([0.0, 0.0, 0.0]);
+            node.object["mask_threshold"] = JSONValue(0.5);
+            node.object["opacity"] = JSONValue(layer.opacity / 255.0);
+            node.object["propagate_meshgroup"] = JSONValue(true);
+            JSONValue[] children;
+            foreach (child; treeNode.children)
+                children ~= buildNodeJson(child, document, nextUuid, textureBlobs, true);
+            if (children.length > 0) node.object["children"] = JSONValue(children);
+            return node;
         }
 
         auto node = baseNodeJson(uuid, layer.name, "Node", layer.visible, 0);
         JSONValue[] children;
         children.reserve(treeNode.children.length);
         foreach (child; treeNode.children) {
-            children ~= buildNodeJson(child, document, nextUuid, textureBlobs);
+            children ~= buildNodeJson(child, document, nextUuid, textureBlobs, insideComposite);
         }
         if (children.length > 0) {
             node.object["children"] = JSONValue(children);

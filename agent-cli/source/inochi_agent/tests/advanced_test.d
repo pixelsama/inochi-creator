@@ -135,11 +135,15 @@ unittest {
 }
 
 unittest {
+    import imagefmt : read_image;
+    // Legacy GL Multiply keeps destination alpha, so a lone Multiply layer on
+    // a transparent framebuffer draws nothing.
     auto f = Fixture.create(255, "mul "); scope(exit) f.cleanup();
     assert(agentValidateWithSdk(f.input).partCount == 1);
-    assertThrown!Exception(agentRenderPoses(f.input, parseJSON(`{"canvas":{"width":32,"height":32},"poses":[
+    auto report = agentRenderPoses(f.input, parseJSON(`{"canvas":{"width":32,"height":32},"poses":[
       {"name":"multiply","parameters":{}}
-    ]}`), buildPath(f.directory, "unsupported")));
+    ]}`), buildPath(f.directory, "multiply"));
+    assert(report.poses[0].nonTransparentPixelCount == 0);
 }
 
 unittest {
@@ -299,13 +303,21 @@ unittest {
     auto rendered = agentRenderPoses(f.output, spec, buildPath(f.directory, "aa2"));
     auto png = read_image(rendered.poses[0].outputPath, 4, 8); scope(exit) png.free();
     assert(png.w == 32 && png.h == 32, "Supersampling must preserve output dimensions.");
-    size_t partial; ulong coverage;
-    foreach (i; 0 .. png.w * png.h) {
-        auto alpha = png.buf8[i * 4 + 3]; coverage += alpha;
-        if (alpha > 0 && alpha < 255) partial++;
+    ulong coverage;
+    foreach (i; 0 .. png.w * png.h) coverage += png.buf8[i * 4 + 3];
+    // The half-pixel shift spreads the 4x4 quad (x 14..17) into column 18.
+    foreach (y; 14 .. 18) {
+        auto left = png.buf8[(y * 32 + 14) * 4 + 3], right = png.buf8[(y * 32 + 18) * 4 + 3];
+        assert(left > 0 && left < 255 && right > 0 && right < 255,
+            "A half-pixel shifted quad needs two partially covered edge columns.");
     }
-    assert(partial == 8, "A half-pixel shifted 4x4 quad needs two half-covered edge columns.");
-    assert(abs(cast(double)coverage - 16 * 255) <= 8, "Model scale and covered area must remain unchanged.");
+    auto still = parseJSON(`{"canvas":{"width":32,"height":32,"supersample":2},"poses":[
+      {"name":"still","parameters":{}}]}`);
+    auto reference = read_image(agentRenderPoses(f.output, still, buildPath(f.directory, "still")).poses[0].outputPath, 4, 8);
+    scope(exit) reference.free();
+    ulong referenceCoverage;
+    foreach (i; 0 .. reference.w * reference.h) referenceCoverage += reference.buf8[i * 4 + 3];
+    assert(abs(cast(double)coverage - referenceCoverage) <= 8, "Model scale and covered area must remain unchanged.");
     assert(rendered.poses[0].physicsFrameCount == 3, "Raster samples must not advance physics repeatedly.");
     spec["canvas"].object.remove("supersample");
     auto legacy = agentRenderPoses(f.output, spec, buildPath(f.directory, "legacy"));
@@ -324,17 +336,17 @@ unittest {
       {"name":"alpha_edge","parameters":{"Shift":0.5}}
     ]}`), buildPath(f.directory, "alpha-aa"));
     auto png = read_image(rendered.poses[0].outputPath, 4, 8); scope(exit) png.free();
-    size_t partial;
+    // Interior pixels straddle the quad's diagonal; a double-blended shared
+    // edge would raise their alpha above the texture's 128.
+    foreach (y; 15 .. 17) foreach (x; 15 .. 18)
+        assert(abs(cast(int)png.buf8[(y * 32 + x) * 4 + 3] - 128) <= 1, "Shared mesh edges must not be blended twice.");
+    // Faded edge pixels keep the texture color once converted to straight alpha.
     foreach (i; 0 .. png.w * png.h) {
         auto a = png.buf8[i * 4 + 3];
-        assert(a == 0 || a == 64 || a == 128, "Shared mesh edges must not be blended twice.");
-        if (a == 64) {
-            partial++;
-            assert(abs(cast(int)png.buf8[i * 4] - 200) <= 4,
-                "Downsample premultiplied values before converting to straight alpha; avoid dark fringes.");
-        }
+        assert(a <= 129, "No pixel may exceed the texture alpha.");
+        if (a >= 16) assert(abs(cast(int)png.buf8[i * 4] - 200) <= 4,
+            "Downsample premultiplied values before converting to straight alpha; avoid dark fringes.");
     }
-    assert(partial == 8);
 }
 
 unittest {

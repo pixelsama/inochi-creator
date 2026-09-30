@@ -20,12 +20,24 @@ JSONValue agentCapabilities() {
         "mesh-replace","mesh-replace-path","mesh-retopologize-path","psd-inspect","psd-import","roundtrip",
         "sdk-validate","pose-sample","pose-render","node-rename"],
       "parameter_dimensions":[1,2],"interpolation":["Linear","Nearest","Cubic"],
-      "deformation_inputs":["profiles","offsets"],"mesh_inputs":["grid","custom"],
+      "deformation_inputs":["profiles","offsets"],"mesh_inputs":["grid","custom","auto"],
+      "group_types":["Node","MeshGroup","Composite"],
+      "binding_properties":{"any":["transform.t.x","transform.t.y","transform.t.z","transform.r.x",
+        "transform.r.y","transform.r.z","transform.s.x","transform.s.y","zSort"],
+        "Part":["opacity","tint.r","tint.g","tint.b","screenTint.r","screenTint.g","screenTint.b","deform"],
+        "Composite":["opacity","tint.r","tint.g","tint.b","screenTint.r","screenTint.g","screenTint.b"],
+        "MeshGroup":["deform"]},
+      "blend_modes":["Normal","Multiply","Screen","Overlay","Darken","Lighten","ColorDodge","LinearDodge",
+        "AddGlow","ColorBurn","HardLight","SoftLight","Difference","Exclusion","Subtract","Inverse",
+        "DestinationIn","ClipToLower","SliceFromLower"],
+      "automation":["sine"],
       "physics":["Pendulum","SpringPendulum"],"model_format":"Inochi2D INX",
-      "cpu_renderer":{"blend_modes":["Normal"],"composites":false,
-        "tint":false,"masks":true,"physics":true,
+      "cpu_renderer":{"blend_semantics":"legacy OpenGL (macOS runtime)",
+        "legacy_normal_fallbacks":["Overlay","Darken","ColorBurn","HardLight","SoftLight","Difference"],
+        "composites":true,"composite_masks":false,"tint":true,"masks":true,"physics":true,"automation":true,
         "supersample":{"default":1,"min":1,"max":4,"max_raster_pixels":16777216}},
-      "limits":{"cubism_moc3_export":false,"bound_topology_migration":"UV barycentric; covered UVs only"},
+      "limits":{"cubism_moc3_export":false,"bound_topology_migration":"UV barycentric; covered UVs only",
+        "nested_composites":false},
       "guide":"AGENT_GUIDE.md"
     }`);
 }
@@ -49,6 +61,7 @@ JSONValue agentDescribeModel(string path) {
     result.object["nodes"] = JSONValue(nodes);
     result.object["parameters"] = payload.object.get("param", JSONValue.emptyArray);
     result.object["physics"] = payload.object.get("physics", JSONValue.emptyObject);
+    result.object["automation"] = payload.object.get("automation", JSONValue.emptyArray);
     return result;
 }
 

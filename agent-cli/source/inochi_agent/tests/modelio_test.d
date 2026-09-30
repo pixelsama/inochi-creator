@@ -622,14 +622,16 @@ unittest {
     size_t insideMask = cast(size_t) (12 * rendered.w + 12) * 4;
     assert(rendered.buf8[outsideMask + 3] == 0);
     assert(rendered.buf8[insideMask + 3] > 0);
-    assert(rendered.buf8[insideMask] >= 118 && rendered.buf8[insideMask] <= 121);
+    // Binary GPU-style stencil: at 3x+ the 2x2 mask's corner subsample falls
+    // below the 0.5 alpha threshold, so a little sclera shows through.
+    assert(rendered.buf8[insideMask] >= 118 && rendered.buf8[insideMask] <= 130);
     assert(
         rendered.buf8[insideMask + 1] >= 78 &&
-        rendered.buf8[insideMask + 1] <= 81
+        rendered.buf8[insideMask + 1] <= 92
     );
     assert(
         rendered.buf8[insideMask + 2] >= 198 &&
-        rendered.buf8[insideMask + 2] <= 201
+        rendered.buf8[insideMask + 2] <= 205
     );
     }
 }

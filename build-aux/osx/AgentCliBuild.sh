@@ -60,6 +60,16 @@ else
     exit 1
 fi
 
+INOCHI2D_SERIALIZATION_PATCH="$ROOT/build-aux/osx/patches/inochi2d-serialization-fixes.patch"
+if git -C "$INOCHI2D_DIR" apply --reverse --check "$INOCHI2D_SERIALIZATION_PATCH" >/dev/null 2>&1; then
+    :
+elif git -C "$INOCHI2D_DIR" apply --check "$INOCHI2D_SERIALIZATION_PATCH" >/dev/null 2>&1; then
+    git -C "$INOCHI2D_DIR" apply "$INOCHI2D_SERIALIZATION_PATCH"
+else
+    echo "The Inochi2D serialization patch does not match $INOCHI2D_DIR." >&2
+    exit 1
+fi
+
 # Local registrations are relative to the invoking package's cache. Register
 # from the same directory as describe/build/test, otherwise DUB silently picks
 # an unpatched registry copy for agent-cli.
@@ -70,5 +80,12 @@ ACTION=${1:-build}
 if [ "$#" -gt 0 ]; then
     shift
 fi
+
+# The CPU renderer is roughly 3x slower without inlining; build release
+# unless the caller chose a build type.
+case " $* " in
+    *" --build="*|*" -b "*|*" --build "*) ;;
+    *) if [ "$ACTION" = "build" ]; then set -- "$@" --build=release; fi ;;
+esac
 
 exec dub "$ACTION" --cache=local --compiler="$ROOT/build-aux/osx/agent-ldc2" "$@"

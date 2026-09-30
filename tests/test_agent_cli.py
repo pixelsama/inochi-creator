@@ -167,6 +167,53 @@ class AgentCLIContracts(unittest.TestCase):
                       ok=False, code="VALIDATION_ERROR")
         self.assertFalse((self.directory / "invalid").exists())
 
+    def test_advanced_rig_features_through_public_cli(self):
+        caps = self.call("capabilities")
+        self.assertEqual(caps["group_types"], ["Node", "MeshGroup", "Composite"])
+        self.assertIn("auto", caps["mesh_inputs"])
+        self.assertIn("zSort", caps["binding_properties"]["any"])
+        schema = self.call("schema", "rig")
+        self.assertIn("automation", schema["properties"])
+        self.import_model()
+        spec = {"schema_version": 1,
+                "groups": [{"name": "Warp", "type": "MeshGroup", "paths": ["/Iris"], "columns": 3, "rows": 3},
+                           {"name": "Look", "type": "Composite", "paths": ["/Warp"], "opacity": 0.5}],
+                "parts": [{"path": "/Look/Warp/Iris", "tint": [1, 0.5, 1]}],
+                "meshes": [{"path": "/Look/Warp/Iris", "auto": {"spacing": 2, "margin": 0}}],
+                "parameters": [{"name": "Face", "min": 0, "max": 1, "keys": [0, 1], "bindings": [
+                    {"path": "/Look/Warp", "property": "deform",
+                     "values": [None, {"profiles": [{"type": "translate", "x": 3}]}]},
+                    {"path": "/Look/Warp/Iris", "property": "zSort", "values": [0, 5]},
+                    {"path": "/Look", "property": "screenTint.r", "values": [0, 1]}]}],
+                "automation": [{"name": "Idle", "speed": 2, "bindings": [{"parameter": "Face", "range": [0, 1]}]}]}
+        self.rig.write_text(json.dumps(spec))
+        output = self.directory / "advanced.inx"
+        applied = self.call("rig-apply", self.model, output, self.rig)["rig"]
+        self.assertEqual((applied["meshGroupCount"], applied["compositeCount"],
+                          applied["partPropertyCount"], applied["automationCount"]), (1, 1, 1, 1))
+        described = self.call("model-describe", output)
+        self.assertEqual(described["automation"][0]["name"], "Idle")
+        self.assertEqual([n["type"] for n in described["nodes"] if n["path"] in ("/Look", "/Look/Warp")],
+                         ["Composite", "MeshGroup"])
+        poses = self.directory / "poses.json"
+        poses.write_text(json.dumps({"canvas": {"width": 32, "height": 32}, "poses": [
+            {"name": "rest", "parameters": {}},
+            {"name": "face", "parameters": {"Face": 1}},
+            {"name": "idle", "parameters": {}, "physics": {"frames": 10, "dt": 0.1}}]}))
+        sampled = self.call("pose-sample", output, poses)
+        paths = [p["path"] for p in sampled["poses"][1]["probes"]]
+        self.assertEqual(paths, ["/Look/Warp", "/Look/Warp/Iris"])
+        rest, face = (sampled["poses"][i]["probes"][1] for i in (0, 1))
+        self.assertAlmostEqual(face["worldVertices"][0][0] - rest["worldVertices"][0][0], 3, places=3)
+        self.assertEqual(face["zSort"] - rest["zSort"], 5)
+        rendered = self.call("pose-render", output, poses, self.directory / "advanced")
+        hashes = [p["rgbaSha256"] for p in rendered["poses"]]
+        self.assertEqual(len(set(hashes)), 3)
+        self.assertEqual(rendered["legacyBlendFallbacks"], [])
+        bad = dict(spec, groups=[{"name": "G", "type": "Composite", "paths": ["/Iris"], "columns": 3}])
+        self.rig.write_text(json.dumps(bad))
+        self.call("rig-validate", self.model, self.rig, ok=False, code="VALIDATION_ERROR")
+
     def test_parse_and_missing_file_errors(self):
         self.import_model()
         self.rig.write_text('{')

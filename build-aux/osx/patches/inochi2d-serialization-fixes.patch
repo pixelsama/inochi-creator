@@ -1,0 +1,27 @@
+diff --git a/source/inochi2d/core/automation/package.d b/source/inochi2d/core/automation/package.d
+index 95a7b26..ffb8e2b 100644
+--- a/source/inochi2d/core/automation/package.d
++++ b/source/inochi2d/core/automation/package.d
+@@ -91,7 +91,8 @@ struct AutomationBinding {
+     SerdeException deserializeFromFghj(Fghj data) {
+         data["param"].deserializeValue(this.paramId);
+         data["axis"].deserializeValue(this.axis);
+-        this.range.deserialize(data["axis"]);
++        // Read the declared range, not the axis index.
++        this.range.deserialize(data["range"]);
+         return null;
+     }
+ 
+diff --git a/source/inochi2d/core/nodes/part/package.d b/source/inochi2d/core/nodes/part/package.d
+index a284e75..b93d1ee 100644
+--- a/source/inochi2d/core/nodes/part/package.d
++++ b/source/inochi2d/core/nodes/part/package.d
+@@ -506,7 +506,7 @@ protected:
+         if (!data["screenTint"].isEmpty) deserialize(screenTint, data["screenTint"]);
+ 
+         // Older models may not have emission
+-        if (!data["emissionStrength"].isEmpty) deserialize(tint, data["emissionStrength"]);
++        if (!data["emissionStrength"].isEmpty) data["emissionStrength"].deserializeValue(this.emissionStrength);
+ 
+         // Older models may not have blend mode
+         if (!data["blend_mode"].isEmpty) data["blend_mode"].deserializeValue(this.blendingMode);

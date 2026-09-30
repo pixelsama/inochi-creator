@@ -7,7 +7,7 @@ import std.json : JSONType, JSONValue;
 import std.math : abs, isFinite;
 import std.string : split;
 
-import inochi2d : Node, Part, Puppet, inClearUUIDs, inInit, inLoadINPPuppet;
+import inochi2d : Composite, Drawable, MeshGroup, Node, Part, Puppet, inClearUUIDs, inInit, inLoadINPPuppet;
 import inochi2d.core.param : DeformationParameterBinding;
 import inochi2d.core.nodes.defstack : Deformation;
 import inochi2d.fmt.serialize : inToJson;
@@ -43,6 +43,9 @@ struct AgentPoseProbeSummary {
     double scaleX;
     double scaleY;
     double opacity = 1;
+    double zSort = 0;
+    double[3] tint = [1, 1, 1];
+    double[3] screenTint = [0, 0, 0];
     double deformationMagnitude = 0;
     size_t deformationVertexCount;
     double declaredDeformationMagnitude = 0;
@@ -67,6 +70,10 @@ struct AgentPoseProbeSummary {
         object["scaleX"] = JSONValue(finiteOrZero(scaleX));
         object["scaleY"] = JSONValue(finiteOrZero(scaleY));
         object["opacity"] = JSONValue(finiteOrZero(opacity));
+        object["zSort"] = JSONValue(finiteOrZero(zSort));
+        object["tint"] = JSONValue([JSONValue(finiteOrZero(tint[0])), JSONValue(finiteOrZero(tint[1])), JSONValue(finiteOrZero(tint[2]))]);
+        object["screenTint"] = JSONValue([JSONValue(finiteOrZero(screenTint[0])),
+            JSONValue(finiteOrZero(screenTint[1])), JSONValue(finiteOrZero(screenTint[2]))]);
         object["deformationMagnitude"] = JSONValue(finiteOrZero(deformationMagnitude));
         object["deformationVertexCount"] = JSONValue(cast(ulong) deformationVertexCount);
         object["declaredDeformationMagnitude"] = JSONValue(finiteOrZero(declaredDeformationMagnitude));
@@ -211,8 +218,19 @@ private AgentPoseProbeSummary sampleProbe(
     result.scaleX = transform.scale.x;
     result.scaleY = transform.scale.y;
 
-    if (auto part = cast(Part) node) {
-        result.opacity = node.getValue("opacity");
+    result.zSort = node.zSort;
+    // Effective shader colors, clamped as the runtime clamps them.
+    void colors(float opacity, float[3] tint, float[3] screen) {
+        import std.algorithm : clamp;
+        result.opacity = clamp(opacity * node.getValue("opacity"), 0.0f, 1.0f);
+        foreach (i, key; ["tint.r", "tint.g", "tint.b"]) result.tint[i] = clamp(tint[i] * node.getValue(key), 0.0f, 1.0f);
+        foreach (i, key; ["screenTint.r", "screenTint.g", "screenTint.b"])
+            result.screenTint[i] = clamp(screen[i] + node.getValue(key), 0.0f, 1.0f);
+    }
+    if (auto p = cast(Part) node) colors(p.opacity, p.tint.vector, p.screenTint.vector);
+    if (auto c = cast(Composite) node) colors(c.opacity, c.tint.vector, c.screenTint.vector);
+    // Parts and MeshGroup cages are both Drawables with sampled geometry.
+    if (auto part = cast(Drawable) node) {
         result.deformationVertexCount = part.deformation.length;
         auto mesh = part.getMesh();
         if (part.deformation.length != mesh.vertices.length)
@@ -314,7 +332,7 @@ AgentPoseReport agentSamplePoses(string modelPath, JSONValue specification) {
             JSONValue[] paths;
             void collect(Node node, string parent, bool root = false) {
                 auto path = root ? "" : parent ~ "/" ~ node.name;
-                if (cast(Part)node) paths ~= JSONValue(path);
+                if (cast(Part)node || cast(MeshGroup)node) paths ~= JSONValue(path);
                 foreach (child; node.children) collect(child, path);
             }
             collect(puppet.root, "", true);

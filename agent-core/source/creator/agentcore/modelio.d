@@ -5,6 +5,7 @@ import std.file : read, write;
 import std.format : format;
 import std.json : JSONType, JSONValue, parseJSON;
 import std.math : abs, isFinite;
+import creator.agentcore.automesh;
 
 enum ubyte[] agentMagicBytes = cast(ubyte[])"TRNSRTS\0";
 enum ubyte[] agentTextureSection = cast(ubyte[])"TEX_SECT";
@@ -58,16 +59,25 @@ struct AgentRigSummary {
     size_t parameterCount;
     size_t bindingCount;
     size_t physicsCount;
+    size_t meshGroupCount;
+    size_t compositeCount;
+    size_t partPropertyCount;
+    size_t automationCount;
 
     string toJson() const {
         return format(
-            `{"groupCount":%s,"meshedPartCount":%s,"maskCount":%s,"parameterCount":%s,"bindingCount":%s,"physicsCount":%s}`,
+            `{"groupCount":%s,"meshedPartCount":%s,"maskCount":%s,"parameterCount":%s,"bindingCount":%s,"physicsCount":%s,` ~
+            `"meshGroupCount":%s,"compositeCount":%s,"partPropertyCount":%s,"automationCount":%s}`,
             groupCount,
             meshedPartCount,
             maskCount,
             parameterCount,
             bindingCount,
-            physicsCount
+            physicsCount,
+            meshGroupCount,
+            compositeCount,
+            partPropertyCount,
+            automationCount
         );
     }
 }
@@ -793,7 +803,14 @@ AgentMeshSummary agentRetopologizePartByPsdPath(
     JSONValue oldMesh;
     if (!findPartMesh(tree, uuid, oldMesh)) throw new Exception("Retopology Part not found.");
     size_t vertexCount, triangleCount;
-    auto mesh = normalizeMesh(requestedMesh, vertexCount, triangleCount);
+    JSONValue mesh;
+    if (requestedMesh.type == JSONType.object && "auto" in requestedMesh.object) {
+        requireFields(requestedMesh, ["auto"], "Retopology request");
+        JSONValue partNode;
+        mutateUniqueNode(document.payload, path, (ref JSONValue node) { partNode = node; });
+        mesh = normalizeMesh(autoMeshForPart(document, partNode, requestedMesh["auto"], "Retopology request"),
+            vertexCount, triangleCount);
+    } else mesh = normalizeMesh(requestedMesh, vertexCount, triangleCount);
     auto oldUV = requireMeshField(oldMesh, "uvs");
     auto newUV = requireMeshField(mesh, "uvs");
     auto oldCount = meshVertexCount(oldMesh, "Source mesh");
@@ -1260,20 +1277,108 @@ private void applyRigPhysics(
     }
 }
 
+enum string[] agentBlendModes = ["Normal", "Multiply", "Screen", "Overlay", "Darken", "Lighten",
+    "ColorDodge", "LinearDodge", "AddGlow", "ColorBurn", "HardLight", "SoftLight", "Difference",
+    "Exclusion", "Subtract", "Inverse", "DestinationIn", "ClipToLower", "SliceFromLower"];
+
+private string readBlendMode(JSONValue value, string label) {
+    import std.algorithm : canFind;
+    if (value.type != JSONType.string || !agentBlendModes.canFind(value.str))
+        throw new Exception(label ~ " blend_mode must be one of " ~ format("%-(%s, %)", agentBlendModes) ~ ".");
+    return value.str;
+}
+
+private JSONValue readColor(JSONValue value, string label) {
+    if (value.type != JSONType.array || value.array.length != 3)
+        throw new Exception(label ~ " must contain [r,g,b].");
+    double[] color;
+    foreach (i, channel; value.array) {
+        double v = readFiniteNumber(channel, format("%s[%s]", label, i));
+        if (v < 0 || v > 1) throw new Exception(label ~ " channels must be in [0,1].");
+        color ~= v;
+    }
+    return numberArray(color);
+}
+
+private double readUnit(JSONValue value, string label) {
+    double v = readFiniteNumber(value, label);
+    if (v < 0 || v > 1) throw new Exception(label ~ " must be in [0,1].");
+    return v;
+}
+
+private bool subtreeHasType(JSONValue node, string type) {
+    if (node.type != JSONType.object) return false;
+    if (objectField(node, "type", JSONValue("")).str == type) return true;
+    foreach (child; objectField(node, "children", JSONValue.emptyArray).array)
+        if (subtreeHasType(child, type)) return true;
+    return false;
+}
+
+// Rest-pose bounds of every Drawable in a subtree, in the coordinate space
+// of the subtree's parent. Only translations are supported here; rotated or
+// scaled intermediate nodes need an explicit MeshGroup mesh.
+private void collectDrawableBounds(JSONValue node, double ox, double oy, ref double[4] bounds, string label) {
+    auto transform = objectField(node, "transform", identityTransformJson());
+    auto trans = objectField(transform, "trans", numberArray([0.0, 0.0, 0.0]));
+    auto rot = objectField(transform, "rot", numberArray([0.0, 0.0, 0.0]));
+    auto scale = objectField(transform, "scale", numberArray([1.0, 1.0]));
+    foreach (i, v; rot.array) if (readFiniteNumber(v, label ~ " rotation") != 0)
+        throw new Exception(label ~ " contains a rotated node; provide an explicit MeshGroup mesh.");
+    foreach (i, v; scale.array) if (readFiniteNumber(v, label ~ " scale") != 1)
+        throw new Exception(label ~ " contains a scaled node; provide an explicit MeshGroup mesh.");
+    double x = ox + readFiniteNumber(trans.array[0], label ~ " translation x");
+    double y = oy + readFiniteNumber(trans.array[1], label ~ " translation y");
+    if ("mesh" in node.object) {
+        auto verts = requireMeshField(node["mesh"], "verts");
+        auto origin = objectField(node["mesh"], "origin", numberArray([0.0, 0.0]));
+        double originX = readFiniteNumber(origin.array[0], label ~ " origin x");
+        double originY = readFiniteNumber(origin.array[1], label ~ " origin y");
+        foreach (i; 0 .. verts.array.length / 2) {
+            double vx = x + readFiniteNumber(verts.array[i * 2], label ~ " vertex x") - originX;
+            double vy = y + readFiniteNumber(verts.array[i * 2 + 1], label ~ " vertex y") - originY;
+            if (vx < bounds[0]) bounds[0] = vx;
+            if (vy < bounds[1]) bounds[1] = vy;
+            if (vx > bounds[2]) bounds[2] = vx;
+            if (vy > bounds[3]) bounds[3] = vy;
+        }
+    }
+    foreach (child; objectField(node, "children", JSONValue.emptyArray).array)
+        collectDrawableBounds(child, x, y, bounds, label);
+}
+
+private JSONValue boundsMesh(double minX, double minY, double maxX, double maxY) {
+    JSONValue[string] mesh;
+    mesh["verts"] = numberArray([minX, minY, minX, maxY, maxX, minY, maxX, maxY]);
+    mesh["uvs"] = numberArray([0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
+    mesh["indices"] = indexArray([0UL, 1, 2, 2, 1, 3]);
+    mesh["origin"] = numberArray([0.0, 0.0]);
+    return JSONValue(mesh);
+}
+
 private void applyRigGroups(
     ref JSONValue payload,
     JSONValue groups,
     ref AgentRigSummary summary,
     ref ulong nextUuid
 ) {
+    import std.algorithm : canFind;
     if (groups.type != JSONType.array) {
         throw new Exception("Rig specification groups must be an array.");
     }
 
     foreach (groupIndex, groupRequest; groups.array) {
         string label = format("Group request %s", groupIndex);
-        requireFields(groupRequest, ["name", "paths", "pivot", "zsort"], label);
+        requireFields(groupRequest, ["name", "paths", "pivot", "zsort", "type", "mesh", "columns", "rows",
+            "margin", "dynamic", "blend_mode", "opacity", "tint", "screen_tint", "propagate_meshgroup"], label);
         string name = requiredString(groupRequest, "name", label);
+        string type = "type" in groupRequest.object ? requiredString(groupRequest, "type", label) : "Node";
+        if (type != "Node" && type != "MeshGroup" && type != "Composite")
+            throw new Exception(label ~ " type must be Node, MeshGroup or Composite.");
+        string[] allowed = ["name", "paths", "pivot", "zsort", "type"];
+        if (type == "MeshGroup") allowed ~= ["mesh", "columns", "rows", "margin", "dynamic"];
+        if (type == "Composite") allowed ~= ["blend_mode", "opacity", "tint", "screen_tint", "propagate_meshgroup"];
+        foreach (key, ignored; groupRequest.object)
+            if (!allowed.canFind(key)) throw new Exception(label ~ " field '" ~ key ~ "' does not apply to type " ~ type ~ ".");
         auto paths = objectField(groupRequest, "paths", JSONValue(JSONValue[].init));
         if (paths.type != JSONType.array || paths.array.length == 0) {
             throw new Exception(format("%s requires a non-empty paths array.", label));
@@ -1334,9 +1439,151 @@ private void applyRigGroups(
             pivotX,
             pivotY
         );
+        if (type == "MeshGroup") {
+            bool custom = ("mesh" in groupRequest.object) !is null;
+            if (custom && ("columns" in groupRequest.object || "rows" in groupRequest.object || "margin" in groupRequest.object))
+                throw new Exception(label ~ " cannot combine a custom mesh with grid fields.");
+            JSONValue mesh;
+            if (custom) {
+                size_t vertexCount, triangleCount;
+                mesh = normalizeMesh(groupRequest["mesh"], vertexCount, triangleCount);
+            } else {
+                double[4] bounds = [double.infinity, double.infinity, -double.infinity, -double.infinity];
+                foreach (child; children) collectDrawableBounds(child, 0, 0, bounds, label);
+                if (!(bounds[0] < bounds[2]) || !(bounds[1] < bounds[3]))
+                    throw new Exception(label ~ " children have no drawable area; provide an explicit mesh.");
+                double margin = readFiniteNumber(objectField(groupRequest, "margin", JSONValue(8.0)), label ~ " margin");
+                if (margin < 0) throw new Exception(label ~ " margin must not be negative.");
+                auto columns = cast(size_t)readIndex(objectField(groupRequest, "columns", JSONValue(5)), label ~ " columns");
+                auto rows = cast(size_t)readIndex(objectField(groupRequest, "rows", JSONValue(5)), label ~ " rows");
+                mesh = buildGridMesh(boundsMesh(bounds[0] - margin, bounds[1] - margin,
+                    bounds[2] + margin, bounds[3] + margin), columns, rows);
+            }
+            auto dynamic = objectField(groupRequest, "dynamic", JSONValue(false));
+            if (dynamic.type != JSONType.true_ && dynamic.type != JSONType.false_)
+                throw new Exception(label ~ " dynamic must be boolean.");
+            groupNode.object["type"] = JSONValue("MeshGroup");
+            groupNode.object["mesh"] = mesh;
+            groupNode.object["dynamic_deformation"] = dynamic;
+            groupNode.object["translate_children"] = JSONValue(true);
+            summary.meshGroupCount++;
+        } else if (type == "Composite") {
+            foreach (child; children) if (subtreeHasType(child, "Composite"))
+                throw new Exception(label ~ " cannot contain another Composite; the SDK flattens nested composites.");
+            groupNode.object["type"] = JSONValue("Composite");
+            groupNode.object["blend_mode"] = JSONValue("blend_mode" in groupRequest.object
+                ? readBlendMode(groupRequest["blend_mode"], label) : "Normal");
+            groupNode.object["opacity"] = JSONValue("opacity" in groupRequest.object
+                ? readUnit(groupRequest["opacity"], label ~ " opacity") : 1.0);
+            groupNode.object["tint"] = "tint" in groupRequest.object
+                ? readColor(groupRequest["tint"], label ~ " tint") : numberArray([1.0, 1.0, 1.0]);
+            groupNode.object["screenTint"] = "screen_tint" in groupRequest.object
+                ? readColor(groupRequest["screen_tint"], label ~ " screen_tint") : numberArray([0.0, 0.0, 0.0]);
+            groupNode.object["mask_threshold"] = JSONValue(0.5);
+            auto propagate = objectField(groupRequest, "propagate_meshgroup", JSONValue(true));
+            if (propagate.type != JSONType.true_ && propagate.type != JSONType.false_)
+                throw new Exception(label ~ " propagate_meshgroup must be boolean.");
+            groupNode.object["propagate_meshgroup"] = propagate;
+            summary.compositeCount++;
+        }
         payload["nodes"].object["children"].array ~= groupNode;
         summary.groupCount++;
     }
+}
+
+// Static appearance of existing Parts and Composites. Parameter bindings
+// multiply tint and add screen tint on top of these values at runtime.
+private void applyRigParts(ref JSONValue payload, JSONValue parts, ref AgentRigSummary summary) {
+    if (parts.type != JSONType.array) throw new Exception("Rig specification parts must be an array.");
+    foreach (index, request; parts.array) {
+        string label = format("Part request %s", index);
+        requireFields(request, ["path", "blend_mode", "opacity", "tint", "screen_tint"], label);
+        string path = requiredString(request, "path", label);
+        if (request.object.length < 2) throw new Exception(label ~ " sets no property.");
+        mutateUniqueNode(payload, path, (ref JSONValue node) {
+            string type = objectField(node, "type", JSONValue("")).str;
+            if (type != "Part" && type != "Composite")
+                throw new Exception(format("%s target '%s' is not a Part or Composite.", label, path));
+            if ("blend_mode" in request.object) node.object["blend_mode"] = JSONValue(readBlendMode(request["blend_mode"], label));
+            if ("opacity" in request.object) node.object["opacity"] = JSONValue(readUnit(request["opacity"], label ~ " opacity"));
+            if ("tint" in request.object) node.object["tint"] = readColor(request["tint"], label ~ " tint");
+            if ("screen_tint" in request.object) node.object["screenTint"] = readColor(request["screen_tint"], label ~ " screen_tint");
+        });
+        summary.partPropertyCount++;
+    }
+}
+
+// Sine automation drives parameters over time in the runtime (breathing,
+// idle sway). Waves are added to the tracked value with the parameter's
+// Additive merge mode.
+private void applyRigAutomation(ref JSONValue payload, JSONValue automation, ref AgentRigSummary summary) {
+    if (automation.type != JSONType.array) throw new Exception("Rig specification automation must be an array.");
+    auto parameters = objectField(payload, "param", JSONValue.emptyArray);
+    auto existing = objectField(payload, "automation", JSONValue(JSONValue[].init));
+    if (existing.type != JSONType.array) throw new Exception("INX automation must be an array.");
+    bool[string] names;
+    foreach (index, request; automation.array) {
+        string label = format("Automation request %s", index);
+        requireFields(request, ["name", "type", "speed", "wave", "bindings"], label);
+        string name = requiredString(request, "name", label);
+        if (name in names) throw new Exception("Duplicate automation '" ~ name ~ "'.");
+        names[name] = true;
+        string type = "type" in request.object ? requiredString(request, "type", label) : "sine";
+        if (type != "sine") throw new Exception(label ~ " type must be sine.");
+        double speed = readFiniteNumber(objectField(request, "speed", JSONValue(1.0)), label ~ " speed");
+        if (speed <= 0) throw new Exception(label ~ " speed must be positive.");
+        string wave = "wave" in request.object ? requiredString(request, "wave", label) : "sin";
+        if (wave != "sin" && wave != "cos") throw new Exception(label ~ " wave must be sin or cos.");
+        auto bindings = objectField(request, "bindings", JSONValue.init);
+        if (bindings.type != JSONType.array || bindings.array.length == 0)
+            throw new Exception(label ~ " requires bindings.");
+        JSONValue[] written;
+        bool[string] targets;
+        foreach (bindingIndex, binding; bindings.array) {
+            string bindingLabel = format("%s binding[%s]", label, bindingIndex);
+            requireFields(binding, ["parameter", "axis", "range"], bindingLabel);
+            string parameterName = requiredString(binding, "parameter", bindingLabel);
+            auto axis = readIndex(objectField(binding, "axis", JSONValue(0)), bindingLabel ~ " axis");
+            JSONValue parameter;
+            bool found;
+            foreach (candidate; parameters.array)
+                if (candidate["name"].str == parameterName) { parameter = candidate; found = true; }
+            if (!found) throw new Exception(bindingLabel ~ " references unknown parameter '" ~ parameterName ~ "'.");
+            bool isVec2 = objectField(parameter, "is_vec2", JSONValue(false)).type == JSONType.true_;
+            if (axis > (isVec2 ? 1 : 0)) throw new Exception(bindingLabel ~ " axis is out of range for " ~ parameterName ~ ".");
+            string identity = format("%s#%s", parameterName, axis);
+            if (identity in targets) throw new Exception(bindingLabel ~ " duplicates a parameter axis.");
+            targets[identity] = true;
+            auto range = objectField(binding, "range", JSONValue.init);
+            if (range.type != JSONType.array || range.array.length != 2)
+                throw new Exception(bindingLabel ~ " range must contain [from,to].");
+            double from = readFiniteNumber(range.array[0], bindingLabel ~ " range[0]");
+            double to = readFiniteNumber(range.array[1], bindingLabel ~ " range[1]");
+            double lo = readFiniteNumber(parameter["min"].array[axis], "Parameter min");
+            double hi = readFiniteNumber(parameter["max"].array[axis], "Parameter max");
+            if (from < lo || from > hi || to < lo || to > hi)
+                throw new Exception(bindingLabel ~ " range must lie within the parameter range.");
+            JSONValue[string] entry;
+            entry["param"] = JSONValue(parameterName);
+            entry["axis"] = JSONValue(axis);
+            entry["range"] = numberArray([from, to]);
+            written ~= JSONValue(entry);
+        }
+        JSONValue[string] node;
+        node["type"] = JSONValue("sine");
+        node["name"] = JSONValue(name);
+        node["bindings"] = JSONValue(written);
+        node["speed"] = JSONValue(speed);
+        // The SDK reads the enum by name (it cannot read back its own integer form).
+        node["sine_type"] = JSONValue(wave == "sin" ? "Sin" : "Cos");
+        JSONValue[] kept;
+        foreach (entry; existing.array)
+            if (objectField(entry, "name", JSONValue("")).str != name) kept ~= entry;
+        kept ~= JSONValue(node);
+        existing = JSONValue(kept);
+        summary.automationCount++;
+    }
+    payload.object["automation"] = existing;
 }
 
 private JSONValue buildGridMesh(JSONValue existingMesh, size_t columns, size_t rows) {
@@ -1781,6 +2028,71 @@ private JSONValue deformationBindingValues(
     return JSONValue(result);
 }
 
+/** Builds a mesh that follows a Part's texture alpha. The Part's current mesh
+ * must map UVs linearly onto its vertices (imported quads and grids do), so
+ * generated UVs and local vertices stay aligned with the texture. */
+private JSONValue autoMeshForPart(ref InxDocument document, JSONValue node, JSONValue request, string label) {
+    import imagefmt : IF_ERROR, read_image;
+    requireFields(request, ["spacing", "margin", "alpha_threshold", "max_vertices"], label ~ " auto");
+    auto options = agentReadAutoMeshOptions(request);
+    auto textures = objectField(node, "textures", JSONValue.emptyArray);
+    if (textures.type != JSONType.array || textures.array.length == 0)
+        throw new Exception(label ~ " auto mesh target has no albedo texture.");
+    auto slot = readIndex(textures.array[0], label ~ " texture slot");
+    if (slot >= document.textureBlobs.length)
+        throw new Exception(label ~ " auto mesh target references a missing texture.");
+    auto image = read_image(document.textureBlobs[slot].data, 4, 8);
+    if (image.e != 0) throw new Exception(format("%s could not decode texture: %s.", label, IF_ERROR[image.e]));
+    scope (exit) image.free();
+
+    auto oldMesh = requireMeshField(node, "mesh");
+    auto verts = requireMeshField(oldMesh, "verts");
+    auto uvs = requireMeshField(oldMesh, "uvs");
+    size_t count = verts.array.length / 2;
+    validateNumericArray(uvs, count * 2, label ~ " current uvs");
+    double[4] vb = [double.infinity, double.infinity, -double.infinity, -double.infinity];
+    double[4] ub = vb;
+    foreach (i; 0 .. count) {
+        double x = readFiniteNumber(verts[i * 2], "vertex x"), y = readFiniteNumber(verts[i * 2 + 1], "vertex y");
+        double u = readFiniteNumber(uvs[i * 2], "u"), v = readFiniteNumber(uvs[i * 2 + 1], "v");
+        if (x < vb[0]) vb[0] = x;
+        if (y < vb[1]) vb[1] = y;
+        if (x > vb[2]) vb[2] = x;
+        if (y > vb[3]) vb[3] = y;
+        if (u < ub[0]) ub[0] = u;
+        if (v < ub[1]) ub[1] = v;
+        if (u > ub[2]) ub[2] = u;
+        if (v > ub[3]) ub[3] = v;
+    }
+    if (!(vb[0] < vb[2]) || !(vb[1] < vb[3]) || !(ub[0] < ub[2]) || !(ub[1] < ub[3]))
+        throw new Exception(label ~ " auto mesh target has degenerate bounds.");
+    double sx = (vb[2] - vb[0]) / (ub[2] - ub[0]), sy = (vb[3] - vb[1]) / (ub[3] - ub[1]);
+    foreach (i; 0 .. count) {
+        double x = readFiniteNumber(verts[i * 2], "vertex x"), y = readFiniteNumber(verts[i * 2 + 1], "vertex y");
+        double u = readFiniteNumber(uvs[i * 2], "u"), v = readFiniteNumber(uvs[i * 2 + 1], "v");
+        if (abs(vb[0] + (u - ub[0]) * sx - x) > 1e-3 * (vb[2] - vb[0]) + 1e-6 ||
+            abs(vb[1] + (v - ub[1]) * sy - y) > 1e-3 * (vb[3] - vb[1]) + 1e-6)
+            throw new Exception(label ~ " auto mesh requires a current mesh whose UVs map linearly to vertices.");
+    }
+
+    auto generated = agentGenerateAutoMesh(image.buf8, image.w, image.h, options);
+    double[] outVerts, outUvs;
+    foreach (i; 0 .. generated.pixelPoints.length / 2) {
+        double u = generated.pixelPoints[i * 2] / image.w, v = generated.pixelPoints[i * 2 + 1] / image.h;
+        outUvs ~= [u, v];
+        outVerts ~= [vb[0] + (u - ub[0]) * sx, vb[1] + (v - ub[1]) * sy];
+    }
+    ulong[] indices;
+    foreach (index; generated.indices) indices ~= index;
+    JSONValue[string] mesh;
+    mesh["verts"] = numberArray(outVerts);
+    mesh["uvs"] = numberArray(outUvs);
+    mesh["indices"] = indexArray(indices);
+    mesh["origin"] = objectField(oldMesh, "origin", numberArray([0.0, 0.0]));
+    size_t vertexCount, triangleCount;
+    return normalizeMesh(JSONValue(mesh), vertexCount, triangleCount);
+}
+
 /**
  * Applies a declarative, renderer-free rig specification to an INX document.
  *
@@ -1794,7 +2106,7 @@ AgentRigSummary agentApplyRigSpec(
     string outputPath,
     JSONValue specification
 ) {
-    requireFields(specification, ["schema_version", "groups", "masks", "meshes", "parameters", "physics"], "Rig specification");
+    requireFields(specification, ["schema_version", "groups", "parts", "masks", "meshes", "parameters", "physics", "automation"], "Rig specification");
     if ("schema_version" in specification.object && readIndex(specification["schema_version"], "schema_version") != 1)
         throw new Exception("Unsupported rig schema_version; expected 1.");
     auto document = parseInx(cast(const(ubyte)[]) read(inputPath));
@@ -1821,6 +2133,8 @@ AgentRigSummary agentApplyRigSpec(
         nextUuid
     );
 
+    applyRigParts(document.payload, objectField(specification, "parts", JSONValue(JSONValue[].init)), summary);
+
     auto masks = objectField(
         specification,
         "masks",
@@ -1839,13 +2153,15 @@ AgentRigSummary agentApplyRigSpec(
     bool[string] meshPaths;
     foreach (index, meshRequest; meshes.array) {
         string label = format("Mesh request %s", index);
-        requireFields(meshRequest, ["path", "mesh", "columns", "rows"], label);
+        requireFields(meshRequest, ["path", "mesh", "columns", "rows", "auto"], label);
         string path = requiredString(meshRequest, "path", label);
         if (path in meshPaths) throw new Exception(label ~ " duplicates mesh path '" ~ path ~ "'.");
         meshPaths[path] = true;
         bool custom = ("mesh" in meshRequest.object) !is null;
-        if (custom && ("columns" in meshRequest.object || "rows" in meshRequest.object))
-            throw new Exception(label ~ " cannot combine custom mesh and grid dimensions.");
+        bool automatic = ("auto" in meshRequest.object) !is null;
+        bool grid = "columns" in meshRequest.object || "rows" in meshRequest.object;
+        if ((custom ? 1 : 0) + (automatic ? 1 : 0) + (grid ? 1 : 0) != 1)
+            throw new Exception(label ~ " requires exactly one of mesh, auto or columns/rows.");
         size_t columns = cast(size_t) readIndex(
             objectField(meshRequest, "columns", JSONValue(0)),
             label ~ " columns"
@@ -1855,13 +2171,16 @@ AgentRigSummary agentApplyRigSpec(
             label ~ " rows"
         );
         mutateUniqueNode(document.payload, path, (ref JSONValue node) {
-            if (objectField(node, "type", JSONValue("")).str != "Part") {
-                throw new Exception(format("Grid target '%s' is not a Part.", path));
+            string targetType = objectField(node, "type", JSONValue("")).str;
+            if (targetType != "Part" && !(targetType == "MeshGroup" && !automatic)) {
+                throw new Exception(format(automatic ? "Auto mesh target '%s' is not a Part." :
+                    "Mesh target '%s' is not a Part or MeshGroup.", path));
             }
             auto oldMesh = requireMeshField(node, "mesh");
             size_t vertexCount, triangleCount;
             auto newMesh = custom
                 ? normalizeMesh(meshRequest["mesh"], vertexCount, triangleCount)
+                : automatic ? autoMeshForPart(document, node, meshRequest["auto"], label)
                 : buildGridMesh(oldMesh, columns, rows);
             if (custom && !("uvs" in newMesh.object)) throw new Exception(label ~ " custom mesh requires uvs.");
             if (hasDeformationBinding(document.payload, readIndex(node["uuid"], "Part uuid")) &&
@@ -1945,7 +2264,10 @@ AgentRigSummary agentApplyRigSpec(
 
             bool isDeformation = property == "deform";
             bool isOpacity = property == "opacity";
+            bool isTint = property == "tint.r" || property == "tint.g" || property == "tint.b";
+            bool isScreenTint = property == "screenTint.r" || property == "screenTint.g" || property == "screenTint.b";
             bool isTransform =
+                property == "zSort" ||
                 property == "transform.t.x" ||
                 property == "transform.t.y" ||
                 property == "transform.t.z" ||
@@ -1954,16 +2276,23 @@ AgentRigSummary agentApplyRigSpec(
                 property == "transform.r.z" ||
                 property == "transform.s.x" ||
                 property == "transform.s.y";
-            if (!isDeformation && !isOpacity && !isTransform) {
+            if (!isDeformation && !isOpacity && !isTransform && !isTint && !isScreenTint) {
                 throw new Exception(format(
                     "%s uses unsupported property '%s'.",
                     bindingLabel,
                     property
                 ));
             }
-            if ((isDeformation || isOpacity) && nodeType != "Part") {
+            if (isDeformation && nodeType != "Part" && nodeType != "MeshGroup") {
                 throw new Exception(format(
-                    "%s property '%s' requires a Part target.",
+                    "%s property '%s' requires a Part or MeshGroup target.",
+                    bindingLabel,
+                    property
+                ));
+            }
+            if ((isOpacity || isTint || isScreenTint) && nodeType != "Part" && nodeType != "Composite") {
+                throw new Exception(format(
+                    "%s property '%s' requires a Part or Composite target.",
                     bindingLabel,
                     property
                 ));
@@ -1992,6 +2321,8 @@ AgentRigSummary agentApplyRigSpec(
                     else {
                         double v = readFiniteNumber(cell, cellLabel);
                         if (isOpacity && (v < 0 || v > 1)) throw new Exception(cellLabel ~ " opacity must be in [0,1].");
+                        if (isTint && v < 0) throw new Exception(cellLabel ~ " tint multiplier must not be negative.");
+                        if (isScreenTint && (v < -1 || v > 1)) throw new Exception(cellLabel ~ " screenTint offset must be in [-1,1].");
                         values ~= JSONValue(v);
                     }
                     flags ~= JSONValue(true);
@@ -2038,6 +2369,7 @@ AgentRigSummary agentApplyRigSpec(
         summary,
         nextUuid
     );
+    applyRigAutomation(document.payload, objectField(specification, "automation", JSONValue(JSONValue[].init)), summary);
     write(outputPath, serializeInx(document));
     return summary;
 }
